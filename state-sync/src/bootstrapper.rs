@@ -12,7 +12,7 @@ use executor_types::ChunkExecutor;
 use futures::channel::mpsc;
 use std::{boxed::Box, collections::HashMap, sync::Arc};
 use storage_interface::DbReader;
-use subscription_service::ReconfigSubscription;
+use subscription_service::{NetworkIdentitySubscription, ReconfigSubscription};
 use tokio::runtime::{Builder, Runtime};
 
 /// Creates and bootstraps new state syncs and creates clients for
@@ -31,6 +31,7 @@ impl StateSyncBootstrapper {
         node_config: &NodeConfig,
         waypoint: Waypoint,
         reconfig_event_subscriptions: Vec<ReconfigSubscription>,
+        network_identity_subscriptions: Vec<NetworkIdentitySubscription>,
     ) -> Self {
         let runtime = Builder::new_multi_thread()
             .thread_name("state-sync")
@@ -38,7 +39,12 @@ impl StateSyncBootstrapper {
             .build()
             .expect("[State Sync] Failed to create runtime!");
 
-        let executor_proxy = ExecutorProxy::new(storage, executor, reconfig_event_subscriptions);
+        let executor_proxy = ExecutorProxy::new(
+            storage,
+            executor,
+            reconfig_event_subscriptions,
+            network_identity_subscriptions,
+        );
         Self::bootstrap_with_executor_proxy(
             runtime,
             network,

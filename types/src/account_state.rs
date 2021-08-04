@@ -7,8 +7,8 @@ use crate::{
     account_config::{
         currency_code_from_type_tag, AccountResource, AccountRole, BalanceResource,
         ChainIdResource, ChildVASP, Credential, CurrencyInfoResource, DesignatedDealer,
-        DesignatedDealerPreburns, FreezingBit, ParentVASP, PreburnQueueResource, PreburnResource,
-        VASPDomainManager, VASPDomains,
+        DesignatedDealerPreburns, FreezingBit, NetworkIdentityResource, ParentVASP,
+        PreburnQueueResource, PreburnResource, VASPDomainManager, VASPDomains,
     },
     block_metadata::DiemBlockResource,
     diem_timestamp::DiemTimestampResource,
@@ -87,6 +87,10 @@ impl AccountState {
 
     pub fn get_diem_timestamp_resource(&self) -> Result<Option<DiemTimestampResource>> {
         self.get_resource::<DiemTimestampResource>()
+    }
+
+    pub fn get_network_identity_resource(&self) -> Result<Option<NetworkIdentityResource>> {
+        self.get_resource::<NetworkIdentityResource>()
     }
 
     pub fn get_validator_config_resource(&self) -> Result<Option<ValidatorConfigResource>> {

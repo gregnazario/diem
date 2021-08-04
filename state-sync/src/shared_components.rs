@@ -143,7 +143,7 @@ pub(crate) mod test_utils {
 
         // Create executor proxy
         let chunk_executor = Box::new(Executor::<DiemVM>::new(db_rw));
-        let executor_proxy = ExecutorProxy::new(db, chunk_executor, vec![]);
+        let executor_proxy = ExecutorProxy::new(db, chunk_executor, vec![], vec![]);
 
         // Get initial state
         let initial_state = executor_proxy.get_local_storage_state().unwrap();

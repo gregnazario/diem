@@ -11,6 +11,8 @@ use channel::{
     message_queues::QueueStyle,
 };
 use diem_types::{
+    account_address::AccountAddress,
+    account_config::NetworkIdentity,
     event::EventKey,
     on_chain_config::{ConfigID, OnChainConfigPayload},
 };
@@ -49,15 +51,18 @@ impl<T: Clone, U> SubscriptionService<T, U> {
 /// A subscription service for on-chain reconfiguration notifications from state sync
 /// This is declared/implemented here instead of in `types/on_chain_config` because
 /// when `subscription_service` crate is a dependency of `types`, the build-dev fails
-pub type ReconfigSubscription = SubscriptionService<SubscriptionBundle, OnChainConfigPayload>;
+pub type ReconfigSubscription =
+    SubscriptionService<OnChainConfigSubscriptionBundle, OnChainConfigPayload>;
+pub type NetworkIdentitySubscription =
+    SubscriptionService<HashSet<AccountAddress>, Vec<NetworkIdentity>>;
 
 #[derive(Clone)]
-pub struct SubscriptionBundle {
+pub struct OnChainConfigSubscriptionBundle {
     pub configs: HashSet<ConfigID>,
     pub events: HashSet<EventKey>,
 }
 
-impl SubscriptionBundle {
+impl OnChainConfigSubscriptionBundle {
     pub fn new(configs: Vec<ConfigID>, events: Vec<EventKey>) -> Self {
         let configs = configs.into_iter().collect::<HashSet<_>>();
         let events = events.into_iter().collect::<HashSet<_>>();
@@ -75,7 +80,16 @@ impl ReconfigSubscription {
         configs: Vec<ConfigID>,
         events: Vec<EventKey>,
     ) -> (Self, Receiver<(), OnChainConfigPayload>) {
-        let bundle = SubscriptionBundle::new(configs, events);
+        let bundle = OnChainConfigSubscriptionBundle::new(configs, events);
         Self::subscribe(name, bundle)
+    }
+}
+
+impl NetworkIdentitySubscription {
+    pub fn subscribe_all(
+        name: &str,
+        accounts: HashSet<AccountAddress>,
+    ) -> (Self, Receiver<(), Vec<NetworkIdentity>>) {
+        Self::subscribe(name, accounts)
     }
 }

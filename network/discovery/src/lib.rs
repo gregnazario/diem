@@ -1,7 +1,10 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{counters::DISCOVERY_COUNTS, file::FileStream, validator_set::ValidatorSetStream};
+use crate::{
+    counters::DISCOVERY_COUNTS, file::FileStream, onchain::OnChainStream,
+    validator_set::ValidatorSetStream,
+};
 use channel::{diem_channel, diem_channel::Receiver};
 use diem_config::{config::PeerSet, network_id::NetworkContext};
 use diem_crypto::x25519;
@@ -9,7 +12,10 @@ use diem_logger::prelude::*;
 use diem_network_address_encryption::Encryptor;
 use diem_secure_storage::Storage;
 use diem_time_service::TimeService;
-use diem_types::on_chain_config::{OnChainConfigPayload, ON_CHAIN_CONFIG_REGISTRY};
+use diem_types::{
+    account_config::NetworkIdentity,
+    on_chain_config::{OnChainConfigPayload, ON_CHAIN_CONFIG_REGISTRY},
+};
 use futures::{Stream, StreamExt};
 use network::{
     connectivity_manager::{ConnectivityRequest, DiscoverySource},
@@ -28,6 +34,7 @@ use tokio::runtime::Handle;
 
 mod counters;
 mod file;
+mod onchain;
 mod validator_set;
 
 #[derive(Debug)]
@@ -47,6 +54,7 @@ pub struct DiscoveryChangeListener {
 enum DiscoveryChangeStream {
     ValidatorSet(ValidatorSetStream),
     File(FileStream),
+    OnChain(OnChainStream),
 }
 
 impl Stream for DiscoveryChangeStream {
@@ -56,6 +64,7 @@ impl Stream for DiscoveryChangeStream {
         match self.get_mut() {
             Self::ValidatorSet(stream) => Pin::new(stream).poll_next(cx),
             Self::File(stream) => Pin::new(stream).poll_next(cx),
+            Self::OnChain(stream) => Pin::new(stream).poll_next(cx),
         }
     }
 }
@@ -96,6 +105,21 @@ impl DiscoveryChangeListener {
         ));
         DiscoveryChangeListener {
             discovery_source: DiscoverySource::File,
+            network_context,
+            update_channel,
+            source_stream,
+        }
+    }
+
+    pub fn onchain(
+        network_context: Arc<NetworkContext>,
+        update_channel: channel::Sender<ConnectivityRequest>,
+        network_identity_events: diem_channel::Receiver<(), Vec<NetworkIdentity>>,
+    ) -> Self {
+        let source_stream =
+            DiscoveryChangeStream::OnChain(OnChainStream::new(network_identity_events));
+        DiscoveryChangeListener {
+            discovery_source: DiscoverySource::OnChain,
             network_context,
             update_channel,
             source_stream,

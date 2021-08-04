@@ -21,7 +21,7 @@ use executor_types::{ChunkExecutor, ExecutedTrees};
 use itertools::Itertools;
 use std::{collections::HashSet, convert::TryFrom, sync::Arc};
 use storage_interface::DbReader;
-use subscription_service::ReconfigSubscription;
+use subscription_service::{NetworkIdentitySubscription, ReconfigSubscription};
 
 /// Proxies interactions with execution and storage for state synchronization
 pub trait ExecutorProxyTrait: Send {
@@ -62,6 +62,8 @@ pub(crate) struct ExecutorProxy {
     storage: Arc<dyn DbReader>,
     executor: Box<dyn ChunkExecutor>,
     reconfig_subscriptions: Vec<ReconfigSubscription>,
+    // FIXME: need to write identity to this
+    _network_identity_subscriptions: Vec<NetworkIdentitySubscription>,
     on_chain_configs: OnChainConfigPayload,
 }
 
@@ -70,6 +72,7 @@ impl ExecutorProxy {
         storage: Arc<dyn DbReader>,
         executor: Box<dyn ChunkExecutor>,
         mut reconfig_subscriptions: Vec<ReconfigSubscription>,
+        network_identity_subscriptions: Vec<NetworkIdentitySubscription>,
     ) -> Self {
         let on_chain_configs = Self::fetch_all_configs(&*storage)
             .expect("[state sync] Failed initial read of on-chain configs");
@@ -82,6 +85,7 @@ impl ExecutorProxy {
             storage,
             executor,
             reconfig_subscriptions,
+            _network_identity_subscriptions: network_identity_subscriptions,
             on_chain_configs,
         }
     }
@@ -648,7 +652,7 @@ mod tests {
         // Create executor proxy with given subscription
         let block_executor = Box::new(Executor::<DiemVM>::new(db_rw.clone()));
         let chunk_executor = Box::new(Executor::<DiemVM>::new(db_rw));
-        let executor_proxy = ExecutorProxy::new(db, chunk_executor, vec![subscription]);
+        let executor_proxy = ExecutorProxy::new(db, chunk_executor, vec![subscription], vec![]);
 
         // Verify initial reconfiguration notification is sent
         assert!(

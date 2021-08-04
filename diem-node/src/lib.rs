@@ -27,6 +27,7 @@ use network_builder::builder::NetworkBuilder;
 use state_sync::bootstrapper::StateSyncBootstrapper;
 use std::{
     boxed::Box,
+    collections::HashSet,
     convert::TryFrom,
     net::ToSocketAddrs,
     path::PathBuf,
@@ -39,6 +40,7 @@ use std::{
 };
 use storage_interface::DbReaderWriter;
 use storage_service::start_storage_service_with_db;
+use subscription_service::NetworkIdentitySubscription;
 use tokio::runtime::{Builder, Runtime};
 use tokio_stream::wrappers::IntervalStream;
 
@@ -303,6 +305,7 @@ pub fn setup_environment(node_config: &NodeConfig, logger: Option<Arc<Logger>>) 
     let mut mempool_network_handles = vec![];
     let mut consensus_network_handles = None;
     let mut reconfig_subscriptions = vec![];
+    let mut network_identity_subscriptions = vec![];
 
     let (mempool_reconfig_subscription, mempool_reconfig_events) =
         gen_mempool_reconfig_subscription();
@@ -313,6 +316,14 @@ pub fn setup_environment(node_config: &NodeConfig, logger: Option<Arc<Logger>>) 
     if node_config.base.role.is_validator() {
         reconfig_subscriptions.push(consensus_reconfig_subscription);
     }
+
+    // FIXME build into networking
+    let (network_identity_subscription, _network_identity_events) =
+        NetworkIdentitySubscription::subscribe_all(
+            "OnchainNetworkIdentityDiscovery",
+            HashSet::new(),
+        );
+    network_identity_subscriptions.push(network_identity_subscription);
 
     // Gather all network configs into a single vector.
     let mut network_configs: Vec<&NetworkConfig> = node_config.full_node_networks.iter().collect();
@@ -397,6 +408,7 @@ pub fn setup_environment(node_config: &NodeConfig, logger: Option<Arc<Logger>>) 
         node_config,
         genesis_waypoint,
         reconfig_subscriptions,
+        network_identity_subscriptions,
     );
     let (mp_client_sender, mp_client_events) = channel(AC_SMP_CHANNEL_BUFFER_SIZE);
 
