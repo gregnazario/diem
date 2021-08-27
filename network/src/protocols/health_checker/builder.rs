@@ -26,8 +26,8 @@ impl HealthCheckerBuilder {
         ping_failures_tolerated: u64,
         network_tx: HealthCheckerNetworkSender,
         network_rx: HealthCheckerNetworkEvents,
+        peer_db: Arc<PeerDb>,
     ) -> Self {
-        let peer_db = Arc::new(PeerDb::new());
         let service = HealthChecker::new(
             network_context,
             time_service,
