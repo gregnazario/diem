@@ -46,7 +46,6 @@ use rand::{rngs::SmallRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use short_hex_str::AsShortHexStr;
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use crate::application::management::PeerManagementInterface;
 
 pub mod builder;
 mod interface;
@@ -213,7 +212,6 @@ impl HealthChecker {
 
                     match event {
                         Event::NewPeer(metadata) => {
-                            self.network_interface.new_connection(metadata.clone());
                             self.connected.insert(metadata.remote_peer_id, (self.round, 0));
                         }
                         Event::LostPeer(metadata) => {

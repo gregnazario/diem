@@ -5,6 +5,7 @@ use crate::{
     application::{
         db::PeerDb,
         interface::{NetworkInterface, PeerStateChange},
+        management::PeerManagementInterface,
         types::PeerState,
     },
     error::NetworkError,
@@ -17,7 +18,6 @@ use crate::{
 use async_trait::async_trait;
 use diem_types::PeerId;
 use std::{sync::Arc, time::Duration};
-use crate::application::management::PeerManagementInterface;
 
 #[derive(Clone)]
 pub struct HealthCheckNetworkInterface {
