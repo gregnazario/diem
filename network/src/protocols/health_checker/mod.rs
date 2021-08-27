@@ -18,7 +18,6 @@
 //! - Use successful inbound pings as a sign of remote note being healthy
 //! - Ping a peer only in periods of no application-level communication with the peer
 use crate::{
-    application::db::PeerDb,
     constants::NETWORK_CHANNEL_SIZE,
     counters,
     error::NetworkError,
@@ -143,8 +142,6 @@ pub struct HealthChecker {
     time_service: TimeService,
     /// Network interface to send requests to the Network Layer
     network_interface: HealthCheckNetworkInterface,
-    /// Channel to receive notifications from Network layer about new/lost connections.
-    network_rx: HealthCheckerNetworkEvents,
     /// Map from connected peer to last round of successful ping, and number of failures since
     /// then.
     connected: HashMap<PeerId, (u64, u64)>,
@@ -167,20 +164,15 @@ impl HealthChecker {
     pub fn new(
         network_context: Arc<NetworkContext>,
         time_service: TimeService,
-        network_tx: HealthCheckerNetworkSender,
-        network_rx: HealthCheckerNetworkEvents,
+        network_interface: HealthCheckNetworkInterface,
         ping_interval: Duration,
         ping_timeout: Duration,
         ping_failures_tolerated: u64,
     ) -> Self {
-        let peer_db = Arc::new(PeerDb::new());
-        let network_interface = HealthCheckNetworkInterface::new(peer_db, network_tx);
-
         HealthChecker {
             network_context,
             time_service,
             network_interface,
-            network_rx,
             connected: HashMap::new(),
             rng: SmallRng::from_entropy(),
             ping_interval,
@@ -202,7 +194,7 @@ impl HealthChecker {
 
         loop {
             futures::select! {
-                maybe_event = self.network_rx.next() => {
+                maybe_event = self.network_interface.next() => {
                     // Shutdown the HealthChecker when this network instance shuts
                     // down. This happens when the `PeerManager` drops.
                     let event = match maybe_event {

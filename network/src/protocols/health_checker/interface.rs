@@ -10,24 +10,40 @@ use crate::{
     },
     error::NetworkError,
     protocols::{
-        health_checker::{HealthCheckerMsg, HealthCheckerNetworkSender},
-        network::RpcError,
+        health_checker::{
+            HealthCheckerMsg, HealthCheckerNetworkEvents, HealthCheckerNetworkSender,
+        },
+        network::{Event, RpcError},
     },
     ProtocolId,
 };
 use async_trait::async_trait;
 use diem_types::PeerId;
-use std::{sync::Arc, time::Duration};
+use futures::{stream::FusedStream, Stream};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
-#[derive(Clone)]
 pub struct HealthCheckNetworkInterface {
     peer_db: Arc<PeerDb>,
     sender: HealthCheckerNetworkSender,
+    receiver: HealthCheckerNetworkEvents,
 }
 
 impl HealthCheckNetworkInterface {
-    pub fn new(peer_db: Arc<PeerDb>, sender: HealthCheckerNetworkSender) -> Self {
-        Self { peer_db, sender }
+    pub fn new(
+        peer_db: Arc<PeerDb>,
+        sender: HealthCheckerNetworkSender,
+        receiver: HealthCheckerNetworkEvents,
+    ) -> Self {
+        Self {
+            peer_db,
+            sender,
+            receiver,
+        }
     }
 
     pub fn sender(&self) -> HealthCheckerNetworkSender {
@@ -71,5 +87,19 @@ impl PeerStateChange for HealthCheckNetworkInterface {
 impl PeerManagementInterface for HealthCheckNetworkInterface {
     fn db(&self) -> &PeerDb {
         &self.peer_db
+    }
+}
+
+impl Stream for HealthCheckNetworkInterface {
+    type Item = Event<HealthCheckerMsg>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().receiver).poll_next(cx)
+    }
+}
+
+impl FusedStream for HealthCheckNetworkInterface {
+    fn is_terminated(&self) -> bool {
+        self.receiver.is_terminated()
     }
 }

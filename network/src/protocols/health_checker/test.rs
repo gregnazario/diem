@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::{
+    application::db::PeerDb,
     peer_manager::{
         self, conn_notifs_channel, ConnectionRequest, PeerManagerNotification, PeerManagerRequest,
     },
@@ -47,8 +48,7 @@ impl TestHarness {
         let health_checker = HealthChecker::new(
             NetworkContext::mock(),
             mock_time.clone(),
-            hc_network_tx,
-            hc_network_rx,
+            HealthCheckNetworkInterface::new(Arc::new(PeerDb::new()), hc_network_tx, hc_network_rx),
             PING_INTERVAL,
             PING_TIMEOUT,
             ping_failures_tolerated,
