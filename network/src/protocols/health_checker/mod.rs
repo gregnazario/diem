@@ -18,12 +18,14 @@
 //! - Use successful inbound pings as a sign of remote note being healthy
 //! - Ping a peer only in periods of no application-level communication with the peer
 use crate::{
+    application::db::PeerDb,
     constants::NETWORK_CHANNEL_SIZE,
     counters,
     error::NetworkError,
     logging::NetworkSchema,
     peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
     protocols::{
+        health_checker::interface::HealthCheckNetworkInterface,
         network::{Event, NetworkEvents, NetworkSender, NewNetworkSender},
         rpc::error::RpcError,
     },
@@ -44,8 +46,10 @@ use rand::{rngs::SmallRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use short_hex_str::AsShortHexStr;
 use std::{collections::HashMap, sync::Arc, time::Duration};
+use crate::application::management::PeerManagementInterface;
 
 pub mod builder;
+mod interface;
 #[cfg(test)]
 mod test;
 
@@ -138,8 +142,8 @@ pub struct HealthChecker {
     network_context: Arc<NetworkContext>,
     /// A handle to a time service for easily mocking time-related operations.
     time_service: TimeService,
-    /// Channel to send requests to Network layer.
-    network_tx: HealthCheckerNetworkSender,
+    /// Network interface to send requests to the Network Layer
+    network_interface: HealthCheckNetworkInterface,
     /// Channel to receive notifications from Network layer about new/lost connections.
     network_rx: HealthCheckerNetworkEvents,
     /// Map from connected peer to last round of successful ping, and number of failures since
@@ -170,10 +174,13 @@ impl HealthChecker {
         ping_timeout: Duration,
         ping_failures_tolerated: u64,
     ) -> Self {
+        let peer_db = Arc::new(PeerDb::new());
+        let network_interface = HealthCheckNetworkInterface::new(peer_db, network_tx);
+
         HealthChecker {
             network_context,
             time_service,
-            network_tx,
+            network_interface,
             network_rx,
             connected: HashMap::new(),
             rng: SmallRng::from_entropy(),
@@ -206,6 +213,7 @@ impl HealthChecker {
 
                     match event {
                         Event::NewPeer(metadata) => {
+                            self.network_interface.new_connection(metadata.clone());
                             self.connected.insert(metadata.remote_peer_id, (self.round, 0));
                         }
                         Event::LostPeer(metadata) => {
@@ -268,7 +276,7 @@ impl HealthChecker {
 
                         tick_handlers.push(Self::ping_peer(
                             self.network_context.clone(),
-                            self.network_tx.clone(),
+                            self.network_interface.sender(),
                             peer_id,
                             self.round,
                             nonce,
@@ -389,7 +397,8 @@ impl HealthChecker {
                                 self.network_context,
                                 peer_id.short_str()
                             );
-                            if let Err(err) = self.network_tx.disconnect_peer(peer_id).await {
+                            if let Err(err) = self.network_interface.disconnect_peer(peer_id).await
+                            {
                                 warn!(
                                     NetworkSchema::new(&self.network_context)
                                         .remote_peer(&peer_id),
