@@ -85,13 +85,24 @@ pub trait NetworkInterface<
 /// Therefore, sending messages to multiple networks can be routed by just `PeerNetworkId` without
 /// having to do lookups for `NetworkId` related senders.  Additionally, will give some checking
 /// around attempting to send messages to networks that don't exist.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MultiNetworkSender<
     TMessage: Message + Send,
     Sender: ApplicationNetworkSender<TMessage> + Send,
 > {
     senders: HashMap<NetworkId, Sender>,
     _phantom: PhantomData<TMessage>,
+}
+
+impl<TMessage: Message + Send, Sender: ApplicationNetworkSender<TMessage> + Send>
+    MultiNetworkSender<TMessage, Sender>
+{
+    pub fn new(senders: HashMap<NetworkId, Sender>) -> Self {
+        MultiNetworkSender {
+            senders,
+            _phantom: Default::default(),
+        }
+    }
 }
 
 impl<TMessage: Clone + Message + Send, Sender: ApplicationNetworkSender<TMessage> + Send>
