@@ -27,11 +27,15 @@ use futures::{
 };
 use netcore::transport::ConnectionOrigin;
 use network::{
+    application::storage::PeerMetadataStorage,
     peer_manager::{
         conn_notifs_channel, ConnectionNotification, ConnectionRequestSender,
         PeerManagerNotification, PeerManagerRequest, PeerManagerRequestSender,
     },
-    protocols::network::{NetworkEvents, NewNetworkEvents, NewNetworkSender},
+    protocols::{
+        network::{NetworkEvents, NewNetworkEvents, NewNetworkSender},
+        wire::handshake::v1::ProtocolIdSet,
+    },
     transport::ConnectionMetadata,
     DisconnectReason, ProtocolId,
 };
@@ -314,6 +318,8 @@ pub struct Node {
     runtime: Arc<Runtime>,
     /// Subscriber for mempool events
     subscriber: UnboundedReceiver<SharedMempoolNotification>,
+    /// Global peer connection data
+    peer_metadata_storage: Arc<PeerMetadataStorage>,
 }
 
 /// Reimplement `NodeInfoTrait` for simplicity
@@ -346,8 +352,10 @@ impl NodeInfoTrait for Node {
 impl Node {
     /// Sets up a single node by starting up mempool and any network handles
     pub fn new(node: NodeInfo, config: NodeConfig) -> Node {
-        let (network_interfaces, network_handles) = setup_node_network_interfaces(&node);
-        let (mempool, runtime, subscriber) = start_node_mempool(config, network_handles);
+        let (network_interfaces, network_handles, peer_metadata_storage) =
+            setup_node_network_interfaces(&node);
+        let (mempool, runtime, subscriber) =
+            start_node_mempool(config, network_handles, peer_metadata_storage.clone());
 
         Node {
             node_info: node,
@@ -355,6 +363,7 @@ impl Node {
             network_interfaces,
             runtime: Arc::new(runtime),
             subscriber,
+            peer_metadata_storage,
         }
     }
 
@@ -403,9 +412,13 @@ impl Node {
         peer_role: PeerRole,
         origin: ConnectionOrigin,
     ) {
-        let metadata = ConnectionMetadata::mock_with_role_and_origin(new_peer, peer_role, origin);
+        let mut metadata =
+            ConnectionMetadata::mock_with_role_and_origin(new_peer, peer_role, origin);
+        metadata.application_protocols = ProtocolIdSet::all_known();
         let network_context = self.network_context(is_primary);
-        let notif = ConnectionNotification::NewPeer(metadata, network_context);
+        let notif = ConnectionNotification::NewPeer(metadata.clone(), network_context);
+        self.peer_metadata_storage
+            .insert_connection(network_context.network_id(), metadata);
         self.send_connection_event(is_primary, notif)
     }
 
@@ -416,6 +429,8 @@ impl Node {
             NetworkContext::mock(),
             DisconnectReason::ConnectionLost,
         );
+        self.peer_metadata_storage
+            .remove(&PeerNetworkId::new(self.network(is_primary), lost_peer));
         self.send_connection_event(is_primary, notif)
     }
 
@@ -532,6 +547,7 @@ fn setup_node_network_interfaces(
 ) -> (
     HashMap<NetworkId, NodeNetworkInterface>,
     Vec<MempoolNetworkHandle>,
+    Arc<PeerMetadataStorage>,
 ) {
     let (network_interface, network_handle) = setup_node_network_interface(PeerNetworkId::new(
         node.primary_network(),
@@ -558,7 +574,12 @@ fn setup_node_network_interfaces(
         network_interfaces.insert(secondary_network_id, network_interface);
     }
 
-    (network_interfaces, network_handles)
+    let network_ids: Vec<_> = network_handles
+        .iter()
+        .map(|(network_id, _, _)| *network_id)
+        .collect();
+    let peer_metadata_storage = PeerMetadataStorage::new(&network_ids);
+    (network_interfaces, network_handles, peer_metadata_storage)
 }
 
 /// Builds a single network interface with associated queues, and attaches it to the top level network
@@ -592,6 +613,7 @@ fn setup_node_network_interface(
 fn start_node_mempool(
     config: NodeConfig,
     network_handles: Vec<MempoolNetworkHandle>,
+    peer_metadata_storage: Arc<PeerMetadataStorage>,
 ) -> (
     Arc<Mutex<CoreMempool>>,
     Runtime,
@@ -608,7 +630,6 @@ fn start_node_mempool(
         Arc::new(RwLock::new(DbReaderWriter::new(MockDbReaderWriter))),
     );
     let reconfig_event_subscriber = event_subscriber.subscribe_to_reconfigurations().unwrap();
-
     let runtime = Builder::new_multi_thread()
         .thread_name("shared-mem")
         .enable_all()
@@ -626,6 +647,7 @@ fn start_node_mempool(
         Arc::new(MockDbReaderWriter),
         Arc::new(RwLock::new(MockVMValidator)),
         vec![sender],
+        peer_metadata_storage,
     );
 
     (mempool, runtime, subscriber)
