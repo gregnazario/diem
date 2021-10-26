@@ -323,12 +323,26 @@ impl TestHarness {
         // Await broadcast notification
         // Note: If there are other messages you're looking for, this could throw them away
         // Wait for the number of messages to be broadcasted on this node
+        let sender = self.mut_node(sender_id);
+        let sender_peer_network_id = sender.peer_network_id(network_id);
         for _ in 0..num_messages {
-            self.wait_for_event(sender_id, SharedMempoolNotification::Broadcast);
+            match sender.next_event() {
+                SharedMempoolNotification::Broadcast(peer_network_id) => {
+                    assert_ne!(
+                        sender_peer_network_id, peer_network_id,
+                        "Shouldn't send messages to itself"
+                    );
+                    assert_eq!(
+                        sender_peer_network_id.network_id(),
+                        peer_network_id.network_id(),
+                        "Should be sending on the same network"
+                    );
+                }
+                event => panic!("Received a non-broadcast notification {:?}", event),
+            }
         }
 
         // Get the outgoing network request on the sender
-        let sender = self.mut_node(sender_id);
         let sender_peer_id = sender.peer_id(network_id);
         let network_req = sender.get_next_network_req(network_id);
 
@@ -370,7 +384,9 @@ impl TestHarness {
                             ProtocolId::MempoolDirectSend,
                             PeerManagerNotification::RecvMessage(sender_peer_id, msg),
                         );
-                        receiver.wait_for_event(SharedMempoolNotification::NewTransactions);
+                        receiver.wait_for_event(SharedMempoolNotification::NewTransactions(Some(
+                            sender_peer_network_id,
+                        )));
 
                         // Verify transaction was inserted into Mempool
                         if check_txns_in_mempool {
@@ -385,7 +401,7 @@ impl TestHarness {
 
                         // Sends an ACK response
                         if !drop_ack {
-                            self.deliver_response(&receiver_id, network_id);
+                            self.deliver_response(&receiver_id, sender_id, network_id);
                         }
                         (transactions, remote_peer_id)
                     }
@@ -439,9 +455,18 @@ impl TestHarness {
     }
 
     /// Delivers broadcast ACK from `peer`.
-    fn deliver_response(&mut self, sender_id: &NodeId, network_id: NetworkId) {
+    fn deliver_response(
+        &mut self,
+        sender_id: &NodeId,
+        receiver_id: &NodeId,
+        network_id: NetworkId,
+    ) {
         // Wait for an ACK to come in on the events
-        self.wait_for_event(sender_id, SharedMempoolNotification::ACK);
+        let receiver_peer_network_id = self.node(receiver_id).peer_network_id(network_id);
+        self.wait_for_event(
+            sender_id,
+            SharedMempoolNotification::ACK(receiver_peer_network_id),
+        );
         let sender = self.mut_node(sender_id);
         let sender_peer_id = sender.peer_id(network_id);
         let network_req = sender.get_next_network_req(network_id);
@@ -872,7 +897,7 @@ fn test_max_broadcast_limit() {
 
     // Deliver ACK from B to A.
     // This should unblock A to send more broadcasts.
-    harness.deliver_response(v_b, NetworkId::Validator);
+    harness.deliver_response(v_b, v_a, NetworkId::Validator);
     let (txns, _) = harness.broadcast_txns(v_a, NetworkId::Validator, 1, false, true, true);
     assert_eq!(3, txns.get(0).unwrap().sequence_number());
 

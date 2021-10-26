@@ -79,10 +79,10 @@ impl<V: TransactionValidation + 'static> SharedMempool<V> {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum SharedMempoolNotification {
-    PeerStateChange,
-    NewTransactions,
-    ACK,
-    Broadcast,
+    PeerStateChange(PeerNetworkId),
+    NewTransactions(Option<PeerNetworkId>),
+    ACK(PeerNetworkId),
+    Broadcast(PeerNetworkId),
 }
 
 pub(crate) fn notify_subscribers(

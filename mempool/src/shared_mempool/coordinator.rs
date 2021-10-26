@@ -243,7 +243,10 @@ async fn handle_network_event<V>(
             debug!(LogSchema::new(LogEntry::NewPeer)
                 .peer(&peer)
                 .is_upstream_peer(is_upstream_peer));
-            notify_subscribers(SharedMempoolNotification::PeerStateChange, &smp.subscribers);
+            notify_subscribers(
+                SharedMempoolNotification::PeerStateChange(peer),
+                &smp.subscribers,
+            );
             if is_new_peer && is_upstream_peer {
                 tasks::execute_broadcast(peer, false, smp, scheduled_broadcasts, executor.clone());
             }
@@ -258,7 +261,10 @@ async fn handle_network_event<V>(
                         .is_upstream_peer(&peer, Some(&metadata))
                 ));
             smp.network_interface.disable_peer(peer);
-            notify_subscribers(SharedMempoolNotification::PeerStateChange, &smp.subscribers);
+            notify_subscribers(
+                SharedMempoolNotification::PeerStateChange(peer),
+                &smp.subscribers,
+            );
         }
         Event::Message(peer_id, msg) => {
             counters::shared_mempool_event_inc("message");

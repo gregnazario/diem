@@ -92,7 +92,8 @@ pub(crate) async fn process_client_transaction_submission<V>(
     timer.stop_and_record();
     let _timer =
         counters::process_txn_submit_latency_timer(counters::CLIENT_LABEL, counters::CLIENT_LABEL);
-    let statuses = process_incoming_transactions(&smp, vec![transaction], TimelineState::NotReady);
+    let statuses =
+        process_incoming_transactions(&smp, vec![transaction], TimelineState::NotReady, None);
     log_txn_process_results(&statuses, None);
 
     if let Some(status) = statuses.get(0) {
@@ -145,7 +146,7 @@ pub(crate) async fn process_transaction_broadcast<V>(
         peer.network_id().as_str(),
         peer.peer_id().short_str().as_str(),
     );
-    let results = process_incoming_transactions(&smp, transactions, timeline_state);
+    let results = process_incoming_transactions(&smp, transactions, timeline_state, Some(peer));
     log_txn_process_results(&results, Some(peer));
 
     let ack_response = gen_ack_response(request_id, results, &peer);
@@ -159,7 +160,7 @@ pub(crate) async fn process_transaction_broadcast<V>(
         );
         return;
     }
-    notify_subscribers(SharedMempoolNotification::ACK, &smp.subscribers);
+    notify_subscribers(SharedMempoolNotification::ACK(peer), &smp.subscribers);
 }
 
 /// If `MempoolIsFull` on any of the transactions, provide backpressure to the downstream peer.
@@ -213,6 +214,7 @@ pub(crate) fn process_incoming_transactions<V>(
     smp: &SharedMempool<V>,
     transactions: Vec<SignedTransaction>,
     timeline_state: TimelineState,
+    source_peer: Option<PeerNetworkId>,
 ) -> Vec<SubmissionStatusBundle>
 where
     V: TransactionValidation,
@@ -309,7 +311,10 @@ where
             }
         }
     }
-    notify_subscribers(SharedMempoolNotification::NewTransactions, &smp.subscribers);
+    notify_subscribers(
+        SharedMempoolNotification::NewTransactions(source_peer),
+        &smp.subscribers,
+    );
     statuses
 }
 

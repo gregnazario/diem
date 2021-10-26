@@ -404,7 +404,7 @@ impl Node {
         let metadata =
             ConnectionMetadata::mock_with_role_and_origin(new_peer.peer_id(), peer_role, origin);
         let notif = ConnectionNotification::NewPeer(metadata, NetworkContext::mock());
-        self.send_connection_event(new_peer.network_id(), notif)
+        self.send_connection_event(new_peer.network_id(), new_peer, notif)
     }
 
     /// Notifies the `Node` of a `lost_peer`
@@ -414,23 +414,36 @@ impl Node {
             NetworkContext::mock(),
             DisconnectReason::ConnectionLost,
         );
-        self.send_connection_event(lost_peer.network_id(), notif)
+        self.send_connection_event(lost_peer.network_id(), lost_peer, notif)
     }
 
     /// Sends a connection event, and waits for the notification to arrive
-    fn send_connection_event(&mut self, network_id: NetworkId, notif: ConnectionNotification) {
+    fn send_connection_event(
+        &mut self,
+        network_id: NetworkId,
+        peer_network_id: PeerNetworkId,
+        notif: ConnectionNotification,
+    ) {
         self.send_network_notif(network_id, notif);
-        self.wait_for_event(SharedMempoolNotification::PeerStateChange);
+        self.wait_for_event(SharedMempoolNotification::PeerStateChange(peer_network_id));
+    }
+
+    pub fn next_event(&mut self) -> SharedMempoolNotification {
+        self.runtime.block_on(self.subscriber.next()).unwrap()
     }
 
     /// Waits for a specific `SharedMempoolNotification` event
     pub fn wait_for_event(&mut self, expected: SharedMempoolNotification) {
-        let event = self.runtime.block_on(self.subscriber.next()).unwrap();
+        let event = self.next_event();
         if event == expected {
             return;
         }
-
-        panic!("Failed to get expected event '{:?}'", expected)
+        panic!(
+            "Failed to get expected event '{:?}', got {:?} for {:?}",
+            expected,
+            event,
+            self.node_info.peer_network_ids()
+        )
     }
 
     /// Checks that there are no `SharedMempoolNotification`s on the subscriber
