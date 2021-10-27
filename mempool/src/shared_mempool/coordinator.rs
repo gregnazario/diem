@@ -36,7 +36,6 @@ use tokio_stream::wrappers::IntervalStream;
 use vm_validator::vm_validator::TransactionValidation;
 
 use super::types::MempoolClientRequest;
-use network::application::interface::NetworkInterface;
 
 /// Coordinator that handles inbound network events and outbound txn broadcasts.
 pub(crate) async fn coordinator<V>(

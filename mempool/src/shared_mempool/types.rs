@@ -279,3 +279,13 @@ impl BroadcastInfo {
         }
     }
 }
+
+#[derive(Copy, Clone, Debug)]
+pub enum BroadcastError {
+    NetworkSendError,
+    NotScheduledBackoff,
+    NoTransactions,
+    TooManyInFlightBroadcasts,
+    UnknownPeer,
+    UnprioritizedPeer,
+}
