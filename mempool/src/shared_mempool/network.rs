@@ -345,13 +345,12 @@ impl MempoolNetworkInterface {
         // 2. Batch that an earlier ACK marked as retriable
         let mut active_pending_broadcasts = 0;
         let mut expired = None;
+        let timeout = Duration::from_millis(self.mempool_config.shared_mempool_ack_timeout_ms);
 
         // Find earliest batch in timeline index that expired.
         // Note that state.broadcast_info.sent_batches is ordered in decreasing order in the timeline index
         for (batch, sent_time) in state.broadcast_info.sent_batches.iter() {
-            let deadline = sent_time.add(Duration::from_millis(
-                self.mempool_config.shared_mempool_ack_timeout_ms,
-            ));
+            let deadline = sent_time.add(timeout);
             if SystemTime::now().duration_since(deadline).is_ok() {
                 expired = Some(*batch);
             } else {
@@ -368,6 +367,18 @@ impl MempoolNetworkInterface {
             }
         }
         Ok(expired)
+    }
+
+    fn peer_state<'a>(
+        sync_states: &'a mut RwLockWriteGuard<HashMap<PeerNetworkId, PeerSyncState>>,
+        peer: PeerNetworkId,
+    ) -> Result<&'a mut PeerSyncState, BroadcastError> {
+        if let Some(state) = sync_states.get_mut(&peer) {
+            Ok(state)
+        } else {
+            // If we don't have any info about the node, we shouldn't broadcast to it
+            Err(BroadcastError::UnknownPeer)
+        }
     }
 
     fn determine_next_broadcast<'a, V>(
@@ -388,13 +399,7 @@ impl MempoolNetworkInterface {
     where
         V: TransactionValidation,
     {
-        let state = if let Some(state) = sync_states.get_mut(&peer) {
-            state
-        } else {
-            // If we don't have any info about the node, we shouldn't broadcast to it
-            return Err(BroadcastError::UnknownPeer);
-        };
-
+        let state = Self::peer_state(sync_states, peer)?;
         // When not a validator, only broadcast to `default_failovers`
         if !self.role.is_validator() {
             let priority = self
@@ -514,6 +519,104 @@ impl MempoolNetworkInterface {
             state.broadcast_info.sent_batches.len(),
         );
         Ok(())
+    }
+
+    pub async fn execute_broadcast_rpc<V>(
+        &self,
+        peer: PeerNetworkId,
+        scheduled_backoff: bool,
+        smp: &mut SharedMempool<V>,
+    ) -> Result<(), BroadcastError>
+    where
+        V: TransactionValidation,
+    {
+        // Start timer for tracking broadcast latency.
+        let start_time = Instant::now();
+        let (batch_id, transactions, metric_label) = {
+            let mut sync_states = self.sync_states.write_lock();
+            let (_, batch_id, transactions, metric_label) =
+                self.determine_next_broadcast(&mut sync_states, peer, scheduled_backoff, smp)?;
+            (batch_id, transactions, metric_label)
+        };
+        let network_sender = smp.network_interface.sender();
+        let timeout = Duration::from_millis(self.mempool_config.shared_mempool_ack_timeout_ms);
+        let num_txns = transactions.len();
+        let message = MempoolSyncMsg::BroadcastTransactionsRequest {
+            request_id: ProtocolId::MempoolRpc
+                .to_bytes(&batch_id)
+                .expect("failed BCS serialization of batch ID"),
+            transactions,
+        };
+        let response = match network_sender.send_rpc(peer, message, timeout).await {
+            Ok(MempoolSyncMsg::BroadcastTransactionsRequest { .. }) => {
+                error!("Received a BroadcastTransactionsRequest back as a response");
+                return Err(BroadcastError::NoAck);
+            }
+            Ok(response) => Ok(response),
+            Err(e) => match e {
+                RpcError::Error(_)
+                | RpcError::IoError(_)
+                | RpcError::BcsError(_)
+                | RpcError::NotConnected(_)
+                | RpcError::UnexpectedResponseChannelCancel
+                | RpcError::MpscSendError(_)
+                | RpcError::TooManyPending(_)
+                | RpcError::TimedOut => {
+                    counters::network_send_fail_inc(counters::BROADCAST_TXNS);
+                    error!(LogSchema::event_log(
+                        LogEntry::BroadcastTransaction,
+                        LogEvent::NetworkSendFail
+                    )
+                    .peer(&peer)
+                    .error(&e.into()));
+                    return Err(BroadcastError::NetworkSendError);
+                }
+                _ => Err(e),
+            },
+        };
+
+        let mut sync_states = self.sync_states.write_lock();
+        let state = Self::peer_state(&mut sync_states, peer)?;
+        // Update peer sync state with info from above broadcast.
+        state.timeline_id = std::cmp::max(state.timeline_id, batch_id.1);
+        // Turn off backoff mode after every broadcast.
+        state.broadcast_info.backoff_mode = false;
+        state
+            .broadcast_info
+            .sent_batches
+            .insert(batch_id, SystemTime::now());
+        state.broadcast_info.retry_batches.remove(&batch_id);
+        notify_subscribers(SharedMempoolNotification::Broadcast, &smp.subscribers);
+
+        let latency = start_time.elapsed();
+        record_metrics(
+            peer,
+            batch_id,
+            metric_label,
+            scheduled_backoff,
+            latency,
+            num_txns,
+            state.broadcast_info.sent_batches.len(),
+        );
+        match response {
+            Ok(MempoolSyncMsg::BroadcastTransactionsResponse {
+                request_id,
+                retry,
+                backoff,
+            }) => {
+                self.process_broadcast_ack(peer, request_id, retry, backoff, SystemTime::now());
+                Ok(())
+            }
+            Ok(_) => {
+                error!("Received a BroadcastTransactionsRequest back as a response");
+                Err(BroadcastError::NoAck)
+            }
+            Err(e) => {
+                // TODO: add metrics around responses
+                debug!("Didn't receive ACK from peer {}: {:?}", peer, e);
+                Err(BroadcastError::NoAck)
+            }
+        }
     }
 }
 
