@@ -13,7 +13,7 @@ use crate::{
     },
     ConsensusRequest, ConsensusResponse, SubmissionStatus,
 };
-use anyhow::Result;
+use bytes::Bytes;
 use diem_config::network_id::PeerNetworkId;
 use diem_crypto::HashValue;
 use diem_infallible::{Mutex, RwLock};
@@ -25,8 +25,10 @@ use diem_types::{
     transaction::SignedTransaction,
     vm_status::DiscardedVMStatus,
 };
-use futures::{channel::oneshot, stream::FuturesUnordered};
-use network::application::interface::NetworkInterface;
+use futures::{channel::oneshot, stream::FuturesUnordered, SinkExt};
+use network::{
+    application::interface::NetworkInterface, protocols::rpc::error::RpcError, ProtocolId,
+};
 use rayon::prelude::*;
 use short_hex_str::AsShortHexStr;
 use std::{
@@ -84,7 +86,7 @@ pub(crate) fn execute_broadcast<V>(
 pub(crate) async fn process_client_transaction_submission<V>(
     smp: SharedMempool<V>,
     transaction: SignedTransaction,
-    callback: oneshot::Sender<Result<SubmissionStatus>>,
+    callback: oneshot::Sender<anyhow::Result<SubmissionStatus>>,
     timer: HistogramTimer,
 ) where
     V: TransactionValidation,
@@ -156,6 +158,51 @@ pub(crate) async fn process_transaction_broadcast<V>(
             LogSchema::event_log(LogEntry::BroadcastACK, LogEvent::NetworkSendFail)
                 .peer(&peer)
                 .error(&e.into())
+        );
+        return;
+    }
+    notify_subscribers(SharedMempoolNotification::ACK, &smp.subscribers);
+}
+
+/// Processes transactions from other nodes.
+pub(crate) async fn process_transaction_broadcast_rpc<V>(
+    smp: SharedMempool<V>,
+    transactions: Vec<SignedTransaction>,
+    request_id: Vec<u8>,
+    timeline_state: TimelineState,
+    peer: PeerNetworkId,
+    timer: HistogramTimer,
+    protocol: ProtocolId,
+    mut response_channel: oneshot::Sender<Result<Bytes, RpcError>>,
+) where
+    V: TransactionValidation,
+{
+    timer.stop_and_record();
+    let _timer = counters::process_txn_submit_latency_timer(
+        peer.network_id().as_str(),
+        peer.peer_id().short_str().as_str(),
+    );
+    let results = process_incoming_transactions(&smp, transactions, timeline_state);
+    log_txn_process_results(&results, Some(peer));
+
+    let ack_response = gen_ack_response(request_id, results, &peer);
+    let encoded = match protocol.to_bytes(&ack_response) {
+        Ok(bytes) => Ok(bytes.into()),
+        Err(err) => {
+            error!("Failed to encode mempool ack response {:?}", err);
+            // Send a response so that the client on the other end isn't just waiting for a timeout
+            Err(RpcError::Error(anyhow::Error::msg(
+                "Failed to encode response",
+            )))
+        }
+    };
+
+    if let Err(_) = response_channel.send(encoded) {
+        counters::network_send_fail_inc(counters::ACK_TXNS);
+        error!(
+            LogSchema::event_log(LogEntry::BroadcastACK, LogEvent::NetworkSendFail)
+                .peer(&peer)
+                .error(&anyhow::Error::msg("Failed to send mempool ack response"))
         );
         return;
     }
