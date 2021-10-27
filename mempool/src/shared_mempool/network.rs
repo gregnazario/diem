@@ -9,7 +9,8 @@ use crate::{
     shared_mempool::{
         tasks,
         types::{
-            notify_subscribers, BatchId, PeerSyncState, SharedMempool, SharedMempoolNotification,
+            notify_subscribers, BatchId, BroadcastError, PeerSyncState, SharedMempool,
+            SharedMempoolNotification,
         },
     },
 };
@@ -45,7 +46,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
     ops::Add,
-    sync::Arc,
+    sync::{Arc, RwLockWriteGuard},
     time::{Duration, Instant, SystemTime},
 };
 use vm_validator::vm_validator::TransactionValidation;
@@ -318,23 +319,18 @@ impl MempoolNetworkInterface {
         }
     }
 
-    pub fn execute_broadcast<V>(
+    /// Retrieve the [`PeerSyncState`] of the peer if it's eligible for broadcast
+    fn eligible_peer_state<'a>(
         &self,
+        sync_states: &'a mut RwLockWriteGuard<HashMap<PeerNetworkId, PeerSyncState>>,
         peer: PeerNetworkId,
         scheduled_backoff: bool,
-        smp: &mut SharedMempool<V>,
-    ) where
-        V: TransactionValidation,
-    {
-        // Start timer for tracking broadcast latency.
-        let start_time = Instant::now();
-
-        let mut sync_states = self.sync_states.write_lock();
+    ) -> Result<&'a mut PeerSyncState, BroadcastError> {
         let state = if let Some(state) = sync_states.get_mut(&peer) {
             state
         } else {
             // If we don't have any info about the node, we shouldn't broadcast to it
-            return;
+            return Err(BroadcastError::UnknownPeer);
         };
 
         // When not a validator, only broadcast to `default_failovers`
@@ -346,7 +342,7 @@ impl MempoolNetworkInterface {
                 .find_position(|peer_network_id| *peer_network_id == &peer)
                 .map_or(usize::MAX, |(pos, _)| pos);
             if priority > self.mempool_config.default_failovers {
-                return;
+                return Err(BroadcastError::UnprioritizedPeer);
             }
         }
 
@@ -354,82 +350,116 @@ impl MempoolNetworkInterface {
         // This is to ensure the backoff mode is actually honored (there is a chance a broadcast was scheduled
         // in non-backoff mode before backoff mode was turned on - ignore such scheduled broadcasts).
         if state.broadcast_info.backoff_mode && !scheduled_backoff {
-            return;
+            return Err(BroadcastError::NotScheduledBackoff);
         }
+        Ok(state)
+    }
 
-        let batch_id: BatchId;
-        let transactions: Vec<SignedTransaction>;
-        let mut metric_label = None;
-        {
-            let mempool = smp.mempool.lock();
+    /// Syncs [`PeerSyncState`] with Mempool as transactions could be committed by other nodes
+    fn sync_peer_state_with_mempool<V>(smp: &mut SharedMempool<V>, state: &mut PeerSyncState)
+    where
+        V: TransactionValidation,
+    {
+        let mempool = smp.mempool.lock();
+        state.broadcast_info.sent_batches = state
+            .broadcast_info
+            .sent_batches
+            .clone()
+            .into_iter()
+            .filter(|(id, _batch)| !mempool.timeline_range(id.0, id.1).is_empty())
+            .collect::<BTreeMap<BatchId, SystemTime>>();
+    }
 
-            // Sync peer's pending broadcasts with latest mempool state.
-            // A pending broadcast might become empty if the corresponding txns were committed through
-            // another peer, so don't track broadcasts for committed txns.
-            state.broadcast_info.sent_batches = state
-                .broadcast_info
-                .sent_batches
-                .clone()
-                .into_iter()
-                .filter(|(id, _batch)| !mempool.timeline_range(id.0, id.1).is_empty())
-                .collect::<BTreeMap<BatchId, SystemTime>>();
+    /// Finds the oldest expired batch to rebroadcast.  Additionally does throttling for number of batches to be sent
+    /// TODO: Use the rate limiter to handle this kind of throttling
+    fn find_oldest_expired_batch(
+        &self,
+        state: &mut PeerSyncState,
+    ) -> Result<Option<BatchId>, BroadcastError> {
+        // Check for batch to rebroadcast:
+        // 1. Batch that did not receive ACK in configured window of time
+        // 2. Batch that an earlier ACK marked as retriable
+        let mut active_pending_broadcasts = 0;
+        let mut expired = None;
 
-            // Check for batch to rebroadcast:
-            // 1. Batch that did not receive ACK in configured window of time
-            // 2. Batch that an earlier ACK marked as retriable
-            let mut pending_broadcasts = 0;
-            let mut expired = None;
-
-            // Find earliest batch in timeline index that expired.
-            // Note that state.broadcast_info.sent_batches is ordered in decreasing order in the timeline index
-            for (batch, sent_time) in state.broadcast_info.sent_batches.iter() {
-                let deadline = sent_time.add(Duration::from_millis(
-                    self.mempool_config.shared_mempool_ack_timeout_ms,
-                ));
-                if SystemTime::now().duration_since(deadline).is_ok() {
-                    expired = Some(batch);
-                } else {
-                    pending_broadcasts += 1;
-                }
-
-                // The maximum number of broadcasts sent to a single peer that are pending a response ACK at any point.
-                // If the number of un-ACK'ed un-expired broadcasts reaches this threshold, we do not broadcast anymore
-                // and wait until an ACK is received or a sent broadcast expires.
-                // This helps rate-limit egress network bandwidth and not overload a remote peer or this
-                // node's Diem network sender.
-                if pending_broadcasts >= self.mempool_config.max_broadcasts_per_peer {
-                    return;
-                }
+        // Find earliest batch in timeline index that expired.
+        // Note that state.broadcast_info.sent_batches is ordered in decreasing order in the timeline index
+        for (batch, sent_time) in state.broadcast_info.sent_batches.iter() {
+            let deadline = sent_time.add(Duration::from_millis(
+                self.mempool_config.shared_mempool_ack_timeout_ms,
+            ));
+            if SystemTime::now().duration_since(deadline).is_ok() {
+                expired = Some(*batch);
+            } else {
+                active_pending_broadcasts += 1;
             }
-            let retry = state.broadcast_info.retry_batches.iter().rev().next();
 
-            let (new_batch_id, new_transactions) = match std::cmp::max(expired, retry) {
-                Some(id) => {
-                    metric_label = if Some(id) == expired {
-                        Some(counters::EXPIRED_BROADCAST_LABEL)
-                    } else {
-                        Some(counters::RETRY_BROADCAST_LABEL)
-                    };
-
-                    let txns = mempool.timeline_range(id.0, id.1);
-                    (*id, txns)
-                }
-                None => {
-                    // Fresh broadcast
-                    let (txns, new_timeline_id) = mempool.read_timeline(
-                        state.timeline_id,
-                        self.mempool_config.shared_mempool_batch_size,
-                    );
-                    (BatchId(state.timeline_id, new_timeline_id), txns)
-                }
-            };
-
-            batch_id = new_batch_id;
-            transactions = new_transactions;
+            // The maximum number of broadcasts sent to a single peer that are pending a response ACK at any point.
+            // If the number of un-ACK'ed un-expired broadcasts reaches this threshold, we do not broadcast anymore
+            // and wait until an ACK is received or a sent broadcast expires.
+            // This helps rate-limit egress network bandwidth and not overload a remote peer or this
+            // node's Diem network sender.
+            if active_pending_broadcasts >= self.mempool_config.max_broadcasts_per_peer {
+                return Err(BroadcastError::TooManyInFlightBroadcasts);
+            }
         }
+        Ok(expired)
+    }
 
+    pub fn execute_broadcast<V>(
+        &self,
+        peer: PeerNetworkId,
+        scheduled_backoff: bool,
+        smp: &mut SharedMempool<V>,
+    ) -> Result<(), BroadcastError>
+    where
+        V: TransactionValidation,
+    {
+        // Start timer for tracking broadcast latency.
+        let start_time = Instant::now();
+
+        let mut sync_states = self.sync_states.write_lock();
+        let state = self.eligible_peer_state(&mut sync_states, peer, scheduled_backoff)?;
+
+        let mut metric_label = None;
+        // Sync peer's pending broadcasts with latest mempool state.
+        // A pending broadcast might become empty if the corresponding txns were committed through
+        // another peer, so don't track broadcasts for committed txns.
+        Self::sync_peer_state_with_mempool(smp, state);
+
+        // Find earliest batch in timeline index that expired.
+        let expired = self.find_oldest_expired_batch(state)?;
+        let retry = state
+            .broadcast_info
+            .retry_batches
+            .iter()
+            .rev()
+            .next()
+            .copied();
+
+        let (batch_id, transactions) = match std::cmp::max(expired, retry) {
+            Some(id) => {
+                metric_label = if Some(id) == expired {
+                    Some(counters::EXPIRED_BROADCAST_LABEL)
+                } else {
+                    Some(counters::RETRY_BROADCAST_LABEL)
+                };
+                let txns = smp.mempool.lock().timeline_range(id.0, id.1);
+                (id, txns)
+            }
+            None => {
+                // Fresh broadcast
+                let (txns, new_timeline_id) = smp.mempool.lock().read_timeline(
+                    state.timeline_id,
+                    self.mempool_config.shared_mempool_batch_size,
+                );
+                (BatchId(state.timeline_id, new_timeline_id), txns)
+            }
+        };
+
+        // Stop here if there are no transactions, don't submit anything
         if transactions.is_empty() {
-            return;
+            return Err(BroadcastError::NoTransactions);
         }
 
         let network_sender = smp.network_interface.sender();
@@ -448,7 +478,7 @@ impl MempoolNetworkInterface {
                     .peer(&peer)
                     .error(&e.into())
             );
-            return;
+            return Err(BroadcastError::NetworkSendError);
         }
         // Update peer sync state with info from above broadcast.
         state.timeline_id = std::cmp::max(state.timeline_id, batch_id.1);
@@ -492,6 +522,7 @@ impl MempoolNetworkInterface {
                 ])
                 .inc();
         }
+        Ok(())
     }
 }
 

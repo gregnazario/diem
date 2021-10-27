@@ -8,8 +8,8 @@ use crate::{
     logging::{LogEntry, LogEvent, LogSchema},
     network::MempoolSyncMsg,
     shared_mempool::types::{
-        notify_subscribers, ScheduledBroadcast, SharedMempool, SharedMempoolNotification,
-        SubmissionStatusBundle, TransactionSummary,
+        notify_subscribers, BroadcastError, ScheduledBroadcast, SharedMempool,
+        SharedMempoolNotification, SubmissionStatusBundle, TransactionSummary,
     },
     ConsensusRequest, ConsensusResponse, SubmissionStatus,
 };
@@ -25,7 +25,7 @@ use diem_types::{
     transaction::SignedTransaction,
     vm_status::DiscardedVMStatus,
 };
-use futures::{channel::oneshot, stream::FuturesUnordered, SinkExt};
+use futures::{channel::oneshot, stream::FuturesUnordered};
 use network::{
     application::interface::NetworkInterface, protocols::rpc::error::RpcError, ProtocolId,
 };
@@ -57,7 +57,16 @@ pub(crate) fn execute_broadcast<V>(
     let network_interface = &smp.network_interface.clone();
     // If there's no connection, don't bother to broadcast
     if network_interface.app_data().read(&peer).is_some() {
-        network_interface.execute_broadcast(peer, backoff, smp);
+        if let Err(err) = network_interface.execute_broadcast(peer, backoff, smp) {
+            match err {
+                BroadcastError::NetworkSendError => {
+                    // This error is handled in execute broadcast
+                }
+                _ => {
+                    trace!("Skipped broadcast to {} {:?}", peer, err)
+                }
+            }
+        }
     } else {
         // Drop the scheduled broadcast, we're not connected anymore
         return;
@@ -173,7 +182,7 @@ pub(crate) async fn process_transaction_broadcast_rpc<V>(
     peer: PeerNetworkId,
     timer: HistogramTimer,
     protocol: ProtocolId,
-    mut response_channel: oneshot::Sender<Result<Bytes, RpcError>>,
+    response_channel: oneshot::Sender<Result<Bytes, RpcError>>,
 ) where
     V: TransactionValidation,
 {
@@ -197,7 +206,7 @@ pub(crate) async fn process_transaction_broadcast_rpc<V>(
         }
     };
 
-    if let Err(_) = response_channel.send(encoded) {
+    if response_channel.send(encoded).is_err() {
         counters::network_send_fail_inc(counters::ACK_TXNS);
         error!(
             LogSchema::event_log(LogEntry::BroadcastACK, LogEvent::NetworkSendFail)
