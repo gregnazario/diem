@@ -319,42 +319,6 @@ impl MempoolNetworkInterface {
         }
     }
 
-    /// Retrieve the [`PeerSyncState`] of the peer if it's eligible for broadcast
-    fn eligible_peer_state<'a>(
-        &self,
-        sync_states: &'a mut RwLockWriteGuard<HashMap<PeerNetworkId, PeerSyncState>>,
-        peer: PeerNetworkId,
-        scheduled_backoff: bool,
-    ) -> Result<&'a mut PeerSyncState, BroadcastError> {
-        let state = if let Some(state) = sync_states.get_mut(&peer) {
-            state
-        } else {
-            // If we don't have any info about the node, we shouldn't broadcast to it
-            return Err(BroadcastError::UnknownPeer);
-        };
-
-        // When not a validator, only broadcast to `default_failovers`
-        if !self.role.is_validator() {
-            let priority = self
-                .prioritized_peers
-                .lock()
-                .iter()
-                .find_position(|peer_network_id| *peer_network_id == &peer)
-                .map_or(usize::MAX, |(pos, _)| pos);
-            if priority > self.mempool_config.default_failovers {
-                return Err(BroadcastError::UnprioritizedPeer);
-            }
-        }
-
-        // If backoff mode is on for this peer, only execute broadcasts that were scheduled as a backoff broadcast.
-        // This is to ensure the backoff mode is actually honored (there is a chance a broadcast was scheduled
-        // in non-backoff mode before backoff mode was turned on - ignore such scheduled broadcasts).
-        if state.broadcast_info.backoff_mode && !scheduled_backoff {
-            return Err(BroadcastError::NotScheduledBackoff);
-        }
-        Ok(state)
-    }
-
     /// Syncs [`PeerSyncState`] with Mempool as transactions could be committed by other nodes
     fn sync_peer_state_with_mempool<V>(smp: &mut SharedMempool<V>, state: &mut PeerSyncState)
     where
@@ -406,20 +370,50 @@ impl MempoolNetworkInterface {
         Ok(expired)
     }
 
-    pub fn execute_broadcast<V>(
+    fn determine_next_broadcast<'a, V>(
         &self,
+        sync_states: &'a mut RwLockWriteGuard<HashMap<PeerNetworkId, PeerSyncState>>,
         peer: PeerNetworkId,
         scheduled_backoff: bool,
         smp: &mut SharedMempool<V>,
-    ) -> Result<(), BroadcastError>
+    ) -> Result<
+        (
+            &'a mut PeerSyncState,
+            BatchId,
+            Vec<SignedTransaction>,
+            Option<&str>,
+        ),
+        BroadcastError,
+    >
     where
         V: TransactionValidation,
     {
-        // Start timer for tracking broadcast latency.
-        let start_time = Instant::now();
+        let state = if let Some(state) = sync_states.get_mut(&peer) {
+            state
+        } else {
+            // If we don't have any info about the node, we shouldn't broadcast to it
+            return Err(BroadcastError::UnknownPeer);
+        };
 
-        let mut sync_states = self.sync_states.write_lock();
-        let state = self.eligible_peer_state(&mut sync_states, peer, scheduled_backoff)?;
+        // When not a validator, only broadcast to `default_failovers`
+        if !self.role.is_validator() {
+            let priority = self
+                .prioritized_peers
+                .lock()
+                .iter()
+                .find_position(|peer_network_id| *peer_network_id == &peer)
+                .map_or(usize::MAX, |(pos, _)| pos);
+            if priority > self.mempool_config.default_failovers {
+                return Err(BroadcastError::UnprioritizedPeer);
+            }
+        }
+
+        // If backoff mode is on for this peer, only execute broadcasts that were scheduled as a backoff broadcast.
+        // This is to ensure the backoff mode is actually honored (there is a chance a broadcast was scheduled
+        // in non-backoff mode before backoff mode was turned on - ignore such scheduled broadcasts).
+        if state.broadcast_info.backoff_mode && !scheduled_backoff {
+            return Err(BroadcastError::NotScheduledBackoff);
+        }
 
         let mut metric_label = None;
         // Sync peer's pending broadcasts with latest mempool state.
@@ -462,6 +456,24 @@ impl MempoolNetworkInterface {
             return Err(BroadcastError::NoTransactions);
         }
 
+        Ok((state, batch_id, transactions, metric_label))
+    }
+
+    pub fn execute_broadcast<V>(
+        &self,
+        peer: PeerNetworkId,
+        scheduled_backoff: bool,
+        smp: &mut SharedMempool<V>,
+    ) -> Result<(), BroadcastError>
+    where
+        V: TransactionValidation,
+    {
+        // Start timer for tracking broadcast latency.
+        let start_time = Instant::now();
+        let mut sync_states = self.sync_states.write_lock();
+        let (state, batch_id, transactions, metric_label) =
+            self.determine_next_broadcast(&mut sync_states, peer, scheduled_backoff, smp)?;
+
         let network_sender = smp.network_interface.sender();
 
         let num_txns = transactions.len();
@@ -492,37 +504,56 @@ impl MempoolNetworkInterface {
         notify_subscribers(SharedMempoolNotification::Broadcast, &smp.subscribers);
 
         let latency = start_time.elapsed();
-        trace!(
-            LogSchema::event_log(LogEntry::BroadcastTransaction, LogEvent::Success)
-                .peer(&peer)
-                .batch_id(&batch_id)
-                .backpressure(scheduled_backoff)
+        record_metrics(
+            peer,
+            batch_id,
+            metric_label,
+            scheduled_backoff,
+            latency,
+            num_txns,
+            state.broadcast_info.sent_batches.len(),
         );
-        let peer_id = peer.peer_id().short_str();
-        let network_id = peer.network_id();
-        counters::SHARED_MEMPOOL_TRANSACTION_BROADCAST_SIZE
-            .with_label_values(&[network_id.as_str(), peer_id.as_str()])
-            .observe(num_txns as f64);
-        counters::shared_mempool_pending_broadcasts(&peer)
-            .set(state.broadcast_info.sent_batches.len() as i64);
-        counters::SHARED_MEMPOOL_BROADCAST_LATENCY
-            .with_label_values(&[network_id.as_str(), peer_id.as_str()])
-            .observe(latency.as_secs_f64());
-        if let Some(label) = metric_label {
-            counters::SHARED_MEMPOOL_BROADCAST_TYPE_COUNT
-                .with_label_values(&[network_id.as_str(), peer_id.as_str(), label])
-                .inc();
-        }
-        if scheduled_backoff {
-            counters::SHARED_MEMPOOL_BROADCAST_TYPE_COUNT
-                .with_label_values(&[
-                    network_id.as_str(),
-                    peer_id.as_str(),
-                    counters::BACKPRESSURE_BROADCAST_LABEL,
-                ])
-                .inc();
-        }
         Ok(())
+    }
+}
+
+fn record_metrics(
+    peer: PeerNetworkId,
+    batch_id: BatchId,
+    metric_label: Option<&str>,
+    scheduled_backoff: bool,
+    latency: Duration,
+    num_txns: usize,
+    pending_broadcasts: usize,
+) {
+    trace!(
+        LogSchema::event_log(LogEntry::BroadcastTransaction, LogEvent::Success)
+            .peer(&peer)
+            .batch_id(&batch_id)
+            .backpressure(scheduled_backoff)
+    );
+    let peer_id = peer.peer_id().short_str();
+    let network_id = peer.network_id();
+    counters::SHARED_MEMPOOL_TRANSACTION_BROADCAST_SIZE
+        .with_label_values(&[network_id.as_str(), peer_id.as_str()])
+        .observe(num_txns as f64);
+    counters::shared_mempool_pending_broadcasts(&peer).set(pending_broadcasts as i64);
+    counters::SHARED_MEMPOOL_BROADCAST_LATENCY
+        .with_label_values(&[network_id.as_str(), peer_id.as_str()])
+        .observe(latency.as_secs_f64());
+    if let Some(label) = metric_label {
+        counters::SHARED_MEMPOOL_BROADCAST_TYPE_COUNT
+            .with_label_values(&[network_id.as_str(), peer_id.as_str(), label])
+            .inc();
+    }
+    if scheduled_backoff {
+        counters::SHARED_MEMPOOL_BROADCAST_TYPE_COUNT
+            .with_label_values(&[
+                network_id.as_str(),
+                peer_id.as_str(),
+                counters::BACKPRESSURE_BROADCAST_LABEL,
+            ])
+            .inc();
     }
 }
 
