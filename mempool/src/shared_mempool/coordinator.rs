@@ -36,6 +36,7 @@ use tokio_stream::wrappers::IntervalStream;
 use vm_validator::vm_validator::TransactionValidation;
 
 use super::types::MempoolClientRequest;
+use network::application::interface::NetworkInterface;
 
 /// Coordinator that handles inbound network events and outbound txn broadcasts.
 pub(crate) async fn coordinator<V>(
@@ -318,13 +319,51 @@ async fn handle_network_event<V>(
                 }
             }
         }
-        Event::RpcRequest(peer_id, _msg, _, _res_tx) => {
-            counters::unexpected_msg_count_inc(&network_id, &peer_id);
-            sample!(
-                SampleRate::Duration(Duration::from_secs(60)),
-                warn!(LogSchema::new(LogEntry::UnexpectedNetworkMsg)
-                    .peer(&PeerNetworkId::new(network_id, peer_id)))
-            );
+        Event::RpcRequest(peer_id, msg, protocol_id, res_tx) => {
+            match msg {
+                MempoolSyncMsg::BroadcastTransactionsRequest {
+                    request_id,
+                    transactions,
+                } => {
+                    let smp_clone = smp.clone();
+                    let peer = PeerNetworkId::new(network_id, peer_id);
+                    let timeline_state = match smp.network_interface.is_upstream_peer(&peer, None) {
+                        true => TimelineState::NonQualified,
+                        false => TimelineState::NotReady,
+                    };
+                    // This timer measures how long it took for the bounded executor to
+                    // *schedule* the task.
+                    let _timer = counters::task_spawn_latency_timer(
+                        counters::PEER_BROADCAST_EVENT_LABEL,
+                        counters::SPAWN_LABEL,
+                    );
+                    // This timer measures how long it took for the task to go from scheduled
+                    // to started.
+                    let task_start_timer = counters::task_spawn_latency_timer(
+                        counters::PEER_BROADCAST_EVENT_LABEL,
+                        counters::START_LABEL,
+                    );
+                    bounded_executor
+                        .spawn(tasks::process_transaction_broadcast_rpc(
+                            smp_clone,
+                            transactions,
+                            request_id,
+                            timeline_state,
+                            peer,
+                            task_start_timer,
+                            protocol_id,
+                            res_tx,
+                        ))
+                        .await;
+                }
+                MempoolSyncMsg::BroadcastTransactionsResponse { .. } => {
+                    // RPC should be using a callback channel, otherwise this is a response
+                    // that isn't attached to an RPC message
+                    counters::unexpected_msg_count_inc(&network_id, &peer_id);
+                    warn!(LogSchema::new(LogEntry::UnexpectedNetworkMsg)
+                        .peer(&PeerNetworkId::new(network_id, peer_id)));
+                }
+            }
         }
     }
 }
