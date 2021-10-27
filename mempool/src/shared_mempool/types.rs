@@ -282,6 +282,7 @@ impl BroadcastInfo {
 
 #[derive(Copy, Clone, Debug)]
 pub enum BroadcastError {
+    NoAck,
     NetworkSendError,
     NotScheduledBackoff,
     NoTransactions,
