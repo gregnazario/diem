@@ -204,7 +204,7 @@ pub(crate) async fn process_transaction_broadcast_rpc<V>(
         peer.network_id().as_str(),
         peer.peer_id().short_str().as_str(),
     );
-    let results = process_incoming_transactions(&smp, transactions, timeline_state);
+    let results = process_incoming_transactions(&smp, transactions, timeline_state, Some(peer));
     log_txn_process_results(&results, Some(peer));
 
     let ack_response = gen_ack_response(request_id, results, &peer);
@@ -228,7 +228,7 @@ pub(crate) async fn process_transaction_broadcast_rpc<V>(
         );
         return;
     }
-    notify_subscribers(SharedMempoolNotification::ACK, &smp.subscribers);
+    notify_subscribers(SharedMempoolNotification::ACK(peer), &smp.subscribers);
 }
 
 /// If `MempoolIsFull` on any of the transactions, provide backpressure to the downstream peer.

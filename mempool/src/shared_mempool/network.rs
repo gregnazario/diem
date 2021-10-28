@@ -586,7 +586,7 @@ impl MempoolNetworkInterface {
             .sent_batches
             .insert(batch_id, SystemTime::now());
         state.broadcast_info.retry_batches.remove(&batch_id);
-        notify_subscribers(SharedMempoolNotification::Broadcast, &smp.subscribers);
+        notify_subscribers(SharedMempoolNotification::Broadcast(peer), &smp.subscribers);
 
         let latency = start_time.elapsed();
         record_metrics(
