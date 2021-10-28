@@ -12,14 +12,21 @@ use crate::{
         },
     },
 };
+use bytes::Bytes;
 use diem_config::{
     config::{NodeConfig, PeerRole},
     network_id::{NetworkId, PeerNetworkId},
 };
-use diem_types::{transaction::SignedTransaction, PeerId};
+use diem_types::{account_address::AccountAddress, transaction::SignedTransaction, PeerId};
+use futures::{channel::oneshot, FutureExt};
 use netcore::transport::ConnectionOrigin;
 use network::{
+    counters::peer_connected,
     peer_manager::{PeerManagerNotification, PeerManagerRequest},
+    protocols::{
+        network::{RpcError, SerializedRequest},
+        rpc::InboundRpcRequest,
+    },
     ProtocolId,
 };
 use rand::{rngs::StdRng, SeedableRng};
@@ -333,7 +340,7 @@ impl TestHarness {
                         "Shouldn't send messages to itself"
                     );
                     assert_eq!(
-                        sender_peer_network_id.network_id(),
+                        network_id,
                         peer_network_id.network_id(),
                         "Should be sending on the same network"
                     );
@@ -343,80 +350,160 @@ impl TestHarness {
         }
 
         // Get the outgoing network request on the sender
-        let sender_peer_id = sender.peer_id(network_id);
         let network_req = sender.get_next_network_req(network_id);
 
         // Handle outgoing message
         match network_req {
-            PeerManagerRequest::SendDirectSend(remote_peer_id, msg) => {
-                let decoded_msg = bcs::from_bytes(&msg.mdata).unwrap();
-                match decoded_msg {
-                    MempoolSyncMsg::BroadcastTransactionsRequest {
-                        transactions,
-                        request_id: _request_id,
-                    } => {
-                        // If we don't want to forward the request, let's just drop it
-                        if !execute_send {
-                            return (transactions, remote_peer_id);
+            PeerManagerRequest::SendDirectSend(remote_peer_id, msg) => self.handle_request(
+                sender_id,
+                network_id,
+                remote_peer_id,
+                msg,
+                PeerManagerNotification::RecvMessage,
+                check_txns_in_mempool,
+                execute_send,
+                drop_ack,
+            ),
+            PeerManagerRequest::SendRpc(remote_peer_id, msg) => {
+                let (res_tx, res_rx) = oneshot::channel();
+                self.handle_request(
+                    sender_id,
+                    network_id,
+                    remote_peer_id,
+                    msg,
+                    {
+                        |remote_peer_id, msg| {
+                            PeerManagerNotification::RecvRpc(
+                                remote_peer_id,
+                                InboundRpcRequest {
+                                    protocol_id: msg.protocol_id,
+                                    data: msg.data,
+                                    res_tx,
+                                },
+                            )
                         }
-
-                        // Otherwise, let's forward it
-                        let lookup_peer_network_id = match network_id {
-                            NetworkId::Vfn => {
-                                // If this is a validator broadcasting on Vfn we have a problem
-                                assert!(!sender
-                                    .supported_networks()
-                                    .contains(&NetworkId::Validator));
-                                // VFN should have same PeerId but different network from validator
-                                PeerNetworkId::new(
-                                    NetworkId::Validator,
-                                    sender.peer_id(NetworkId::Public),
-                                )
-                            }
-                            _ => PeerNetworkId::new(network_id, remote_peer_id),
-                        };
-                        let receiver_id =
-                            *self.peer_to_node_id.get(&lookup_peer_network_id).unwrap();
-                        let receiver = self.mut_node(&receiver_id);
-
-                        receiver.send_network_req(
-                            network_id,
-                            ProtocolId::MempoolDirectSend,
-                            PeerManagerNotification::RecvMessage(sender_peer_id, msg),
-                        );
-                        receiver.wait_for_event(SharedMempoolNotification::NewTransactions(Some(
-                            sender_peer_network_id,
-                        )));
-
-                        // Verify transaction was inserted into Mempool
-                        if check_txns_in_mempool {
-                            let block = self
-                                .node(sender_id)
-                                .mempool()
-                                .get_block(100, HashSet::new());
-                            for txn in transactions.iter() {
-                                assert!(block.contains(txn));
-                            }
-                        }
-
-                        // Sends an ACK response
-                        if !drop_ack {
-                            self.deliver_response(&receiver_id, sender_id, network_id);
-                        }
-                        (transactions, remote_peer_id)
-                    }
-                    req => {
-                        panic!("Unexpected broadcast transactions response {:?}", req)
-                    }
-                }
-            }
-            req => {
-                panic!(
-                    "Unexpected peer manager request, didn't receive broadcast {:?}",
-                    req
+                    },
+                    check_txns_in_mempool,
+                    execute_send,
+                    drop_ack,
                 )
             }
+            req => panic!(
+                "Unexpected peer manager request, didn't receive broadcast {:?}",
+                req
+            ),
         }
+    }
+
+    fn handle_request<
+        InMsg: SerializedRequest,
+        F: FnOnce(PeerId, InMsg) -> PeerManagerNotification,
+    >(
+        &mut self,
+        sender_id: &NodeId,
+        network_id: NetworkId,
+        remote_peer_id: PeerId,
+        msg: InMsg,
+        to_pm_notification: F,
+        check_txns_in_mempool: bool, // Check whether all txns in this broadcast are accepted into recipient's mempool
+        execute_send: bool, // If true, actually delivers msg to remote peer; else, drop the message (useful for testing unreliable msg delivery)
+        drop_ack: bool,     // If true, drop ack from remote peer to this peer
+    ) -> (Vec<SignedTransaction>, AccountAddress) {
+        let decoded_msg: MempoolSyncMsg = msg.to_message().unwrap();
+        match decoded_msg {
+            MempoolSyncMsg::BroadcastTransactionsRequest {
+                transactions,
+                request_id: _request_id,
+            } => {
+                // If we don't want to forward the request, let's just drop it
+                if !execute_send {
+                    return (transactions, remote_peer_id);
+                }
+
+                // Otherwise, let's forward it
+                let sender = self.mut_node(&sender_id);
+                let sender_peer_id = sender.peer_id(network_id);
+                let sender_peer_network_id = sender.peer_network_id(network_id);
+                let sender_is_vfn = sender.is_vfn();
+                let receiver_id =
+                    self.get_receiver_node_id(sender_id, network_id, remote_peer_id, sender_is_vfn);
+                let receiver = self.mut_node(&receiver_id);
+                receiver.send_network_req(
+                    network_id,
+                    msg.protocol_id(),
+                    to_pm_notification(sender_peer_id, msg),
+                );
+                receiver.wait_for_event(SharedMempoolNotification::NewTransactions(Some(
+                    sender_peer_network_id,
+                )));
+
+                // Optional verify and ack
+                self.verify_and_ack_broadcast(
+                    sender_id,
+                    &receiver_id,
+                    network_id,
+                    &transactions,
+                    check_txns_in_mempool,
+                    drop_ack,
+                );
+                (transactions, remote_peer_id)
+            }
+            req => {
+                panic!("Unexpected broadcast transactions response {:?}", req)
+            }
+        }
+    }
+
+    fn verify_and_ack_broadcast(
+        &mut self,
+        sender_id: &NodeId,
+        receiver_id: &NodeId,
+        network_id: NetworkId,
+        transactions: &Vec<SignedTransaction>,
+        check_txns_in_mempool: bool,
+        drop_ack: bool,
+    ) {
+        // Verify transaction was inserted into Mempool
+        if check_txns_in_mempool {
+            let block = self
+                .node(sender_id)
+                .mempool()
+                .get_block(100, HashSet::new());
+            for txn in transactions.iter() {
+                assert!(block.contains(txn));
+            }
+        }
+
+        // Sends an ACK response
+        if !drop_ack {
+            self.deliver_response(&receiver_id, sender_id, network_id);
+        }
+    }
+
+    fn get_receiver_node_id(
+        &self,
+        sender_id: &NodeId,
+        network_id: NetworkId,
+        remote_peer_id: PeerId,
+        sender_is_vfn: bool,
+    ) -> NodeId {
+        let lookup_peer_network_id = match network_id {
+            NetworkId::Vfn => {
+                // VFN should have same PeerId but different network from validator
+                // The trick here is to forward using the public network PeerId (to determine the Validator) or vice versa
+                let (new_network_id, lookup_network_id) = if sender_is_vfn {
+                    (NetworkId::Validator, NetworkId::Public)
+                } else {
+                    (NetworkId::Public, NetworkId::Validator)
+                };
+                PeerNetworkId::new(
+                    new_network_id,
+                    self.node(sender_id).peer_id(lookup_network_id),
+                )
+            }
+            _ => PeerNetworkId::new(network_id, remote_peer_id),
+        };
+        *self.peer_to_node_id.get(&lookup_peer_network_id).unwrap()
     }
 
     /// Convenience function, broadcasts transactions, and makes sure they got to the right place,
@@ -460,6 +547,7 @@ impl TestHarness {
         sender_id: &NodeId,
         receiver_id: &NodeId,
         network_id: NetworkId,
+        maybe_rpc_response: Option<oneshot::Receiver<Result<Bytes, RpcError>>>,
     ) {
         // Wait for an ACK to come in on the events
         let receiver_peer_network_id = self.node(receiver_id).peer_network_id(network_id);
@@ -469,28 +557,27 @@ impl TestHarness {
         );
         let sender = self.mut_node(sender_id);
         let sender_peer_id = sender.peer_id(network_id);
+        let sender_is_vfn = sender.is_vfn();
         let network_req = sender.get_next_network_req(network_id);
+
+        if let Some(rpc_response) = maybe_rpc_response {
+            let response = rpc_response
+                .now_or_never()
+                .expect("Must have a RPC response");
+        }
 
         match network_req {
             PeerManagerRequest::SendDirectSend(remote_peer_id, msg) => {
-                let decoded_msg = bcs::from_bytes(&msg.mdata).unwrap();
+                let decoded_msg = msg.protocol_id.from_bytes(&msg.mdata).unwrap();
                 match decoded_msg {
                     MempoolSyncMsg::BroadcastTransactionsResponse { .. } => {
                         // send it to peer
-                        let lookup_peer_network_id = match network_id {
-                            NetworkId::Vfn => {
-                                // If this is a VFN responding to a validator we have a problem
-                                assert!(!sender.supported_networks().contains(&NetworkId::Public));
-                                // VFN should have same PeerId but different network from validator
-                                PeerNetworkId::new(
-                                    NetworkId::Public,
-                                    sender.peer_id(NetworkId::Validator),
-                                )
-                            }
-                            _ => PeerNetworkId::new(network_id, remote_peer_id),
-                        };
-                        let receiver_id =
-                            *self.peer_to_node_id.get(&lookup_peer_network_id).unwrap();
+                        let receiver_id = self.get_receiver_node_id(
+                            sender_id,
+                            network_id,
+                            remote_peer_id,
+                            sender_is_vfn,
+                        );
                         let receiver = self.mut_node(&receiver_id);
                         receiver.send_network_req(
                             network_id,

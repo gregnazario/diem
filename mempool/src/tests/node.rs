@@ -366,6 +366,10 @@ impl Node {
         }
     }
 
+    pub fn is_vfn(&self) -> bool {
+        matches!(self.node_info, NodeInfo::Full(_))
+    }
+
     /// Retrieves a `CoreMempool`
     pub fn mempool(&self) -> MutexGuard<CoreMempool> {
         self.mempool.lock()
