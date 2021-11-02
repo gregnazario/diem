@@ -13,5 +13,9 @@ mod node;
 mod shared_mempool_test;
 
 pub mod fuzzing;
+#[cfg(test)]
+mod integration_tests;
 #[cfg(any(feature = "fuzzing", test))]
 pub mod mocks;
+#[cfg(test)]
+mod test_framework;
