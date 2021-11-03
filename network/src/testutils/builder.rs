@@ -15,7 +15,6 @@ use std::{collections::HashMap, marker::PhantomData};
 pub struct TestFrameworkBuilder<Node: TestNode + Sync, Framework: TestFramework<Node>> {
     owners: u32,
     nodes: HashMap<NodeId, Node>,
-    peer_network_id_to_node: HashMap<PeerNetworkId, NodeId>,
     rng: StdRng,
     _framework_marker: PhantomData<Framework>,
 }
@@ -25,14 +24,13 @@ impl<Node: TestNode + Sync, Framework: TestFramework<Node>> TestFrameworkBuilder
         Self {
             owners: 0,
             nodes: HashMap::new(),
-            peer_network_id_to_node: HashMap::new(),
             rng: StdRng::from_seed([0u8; 32]),
             _framework_marker: PhantomData::default(),
         }
     }
 
     pub fn build(self) -> Framework {
-        TestFramework::new(self.nodes, self.peer_network_id_to_node)
+        TestFramework::new(self.nodes)
     }
 
     /// A safety measure to make sure all owners are on purpose
@@ -119,14 +117,26 @@ impl<Node: TestNode + Sync, Framework: TestFramework<Node>> TestFrameworkBuilder
         let node_id = NodeId { owner, node_type };
         assert!(!self.nodes.contains_key(&node_id));
 
-        let node = Framework::build_node(node_id, config, peer_network_ids);
-        self.nodes.insert(node_id, node);
-        for peer_network_id in peer_network_ids {
-            // If we have duplicates, nothing will work
-            assert!(!self.peer_network_id_to_node.contains_key(peer_network_id));
-            self.peer_network_id_to_node
-                .insert(*peer_network_id, node_id);
+        let mut node = Framework::build_node(node_id, config, peer_network_ids);
+        // Add node's sender to every possible node to be connected to
+        // TODO: make this more efficient
+        for (_, other_node) in self.nodes.iter_mut() {
+            if let Some(network_id) = other_node.find_common_network(&node) {
+                let peer_network_id = node.peer_network_id(network_id);
+                other_node.add_other_inbound_handle(
+                    peer_network_id,
+                    node.node_inbound_handle(network_id),
+                );
+
+                let other_peer_network_id = other_node.peer_network_id(network_id);
+                node.add_other_inbound_handle(
+                    other_peer_network_id,
+                    other_node.node_inbound_handle(network_id),
+                );
+            }
         }
+
+        self.nodes.insert(node_id, node);
         self
     }
 }
