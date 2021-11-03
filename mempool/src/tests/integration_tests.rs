@@ -5,130 +5,157 @@ use crate::tests::{
     common::TestTransaction,
     test_framework::{test_transaction, test_transactions, MempoolTestFramework},
 };
-use diem_config::network_id::NetworkId;
 use futures::executor::block_on;
+use netcore::transport::ConnectionOrigin;
+use network::testutils::test_node::drop_next_network_msg;
 use network::testutils::{
-    builder::TestFrameworkBuilder, test_framework::TestFramework, test_node::NodeId,
+    builder::TestFrameworkBuilder,
+    test_framework::TestFramework,
+    test_node::{send_next_network_msg, NodeId, TestNode},
 };
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 #[test]
 fn basic_send_txns_validator_test() {
-    let owner_1 = 0;
-    let owner_2 = 1;
     let mut test_framework: MempoolTestFramework = TestFrameworkBuilder::new()
         .add_owners(2)
-        .add_validator(owner_1)
-        .add_validator(owner_2)
+        .add_validator(0)
+        .add_validator(1)
         .build();
 
-    let v1 = NodeId::validator(owner_1);
-    let v2 = NodeId::validator(owner_2);
-    let test_txns = test_transactions(0, 3);
-    test_framework.connect(v1, v2);
-    let future = async move {
-        let v1_node = test_framework.node_mut(v1);
-        v1_node.add_txns_via_client(&test_txns).await;
-        v1_node.assert_txns_in_mempool(&test_txns);
-        // Send first message and ack
-        test_framework.propagate_msg_and_ack(v1, v2).await;
-        // Ensure messages show up
-        let v1_node = test_framework.node(v1);
-        let v2_node = test_framework.node(v2);
+    let mut sender = test_framework.take_node(NodeId::validator(0));
+    let mut receiver = test_framework.take_node(NodeId::validator(1));
+    let network_id = sender.find_common_network(&receiver).unwrap();
+    let receiver_metadata = receiver.conn_metadata(network_id, ConnectionOrigin::Outbound, None);
 
-        v2_node.assert_txns_in_mempool(&test_txns);
-        v2_node.commit_txns(&test_txns);
+    let sender_test_txns = test_transactions(0, 3);
+    let receiver_test_txns = sender_test_txns.clone();
 
-        v1_node.assert_txns_in_mempool(&test_txns);
-        v2_node.assert_txns_not_in_mempool(&test_txns);
+    // Mempools should be clean at start
+    sender.assert_txns_not_in_mempool(&sender_test_txns);
+    receiver.assert_txns_not_in_mempool(&sender_test_txns);
+
+    let sender_future = async move {
+        sender.connect(network_id, receiver_metadata);
+        sender.add_txns_via_client(&sender_test_txns).await;
+        sender.assert_txns_in_mempool(&sender_test_txns);
+
+        // Send the first message, (if RPC wait for ack)
+        send_next_network_msg(&mut sender, network_id).await;
+
+        // Committed transactions should disappear locally
+        sender.commit_txns(&sender_test_txns);
+        sender.assert_txns_not_in_mempool(&sender_test_txns);
+        sender
     };
-    block_on(future)
+
+    let receiver_future = async move {
+        send_next_network_msg(&mut receiver, network_id).await;
+        receiver.assert_txns_in_mempool(&receiver_test_txns);
+        receiver
+    };
+
+    let _ = block_on(futures::future::join(sender_future, receiver_future));
 }
 
 #[test]
 fn fn_to_val_test() {
-    let owner_1 = 0;
     let mut test_framework: MempoolTestFramework = TestFrameworkBuilder::new()
         .add_owners(1)
-        .add_validator(owner_1)
-        .add_vfn(owner_1)
-        .add_pfn(owner_1)
+        .add_validator(0)
+        .add_vfn(0)
+        .add_pfn(0)
         .build();
 
-    let val = NodeId::validator(owner_1);
-    let vfn = NodeId::vfn(owner_1);
-    let pfn = NodeId::pfn(owner_1);
-    let test_txns = test_transactions(0, 3);
-    test_framework.connect(vfn, val);
-    test_framework.connect(pfn, vfn);
+    let mut val = test_framework.take_node(NodeId::validator(0));
+    let mut vfn = test_framework.take_node(NodeId::vfn(0));
+    let mut pfn = test_framework.take_node(NodeId::pfn(0));
+    let pfn_txns = test_transactions(0, 3);
+    let vfn_txns = pfn_txns.clone();
+    let val_txns = pfn_txns.clone();
 
-    let future = async move {
-        let pfn_node = test_framework.node_mut(pfn);
-        pfn_node.add_txns_via_client(&test_txns).await;
-        pfn_node.assert_txns_in_mempool(&test_txns);
-        // Send to vfn
-        test_framework.propagate_msg_and_ack(pfn, vfn).await;
-        test_framework.node(vfn).assert_txns_in_mempool(&test_txns);
+    let pfn_vfn_network = pfn.find_common_network(&vfn).unwrap();
+    let vfn_metadata = vfn.conn_metadata(pfn_vfn_network, ConnectionOrigin::Outbound, None);
+    let vfn_val_network = vfn.find_common_network(&val).unwrap();
+    let val_metadata = val.conn_metadata(vfn_val_network, ConnectionOrigin::Outbound, None);
 
-        // Send to validator
-        test_framework.propagate_msg_and_ack(vfn, val).await;
-        let validator = test_framework.node(val);
-
-        // Ensure messages show up
-        validator.assert_txns_in_mempool(&test_txns);
-        validator.commit_txns(&test_txns);
-        validator.assert_txns_not_in_mempool(&test_txns);
+    // NOTE: Always return node at end, or it will be dropped and channels closed
+    let pfn_future = async move {
+        pfn.connect(pfn_vfn_network, vfn_metadata);
+        pfn.add_txns_via_client(&pfn_txns).await;
+        pfn.assert_txns_in_mempool(&pfn_txns);
+        // Forward to VFN
+        send_next_network_msg(&mut pfn, pfn_vfn_network).await;
+        pfn
     };
 
-    block_on(future)
+    let vfn_future = async move {
+        vfn.connect(vfn_val_network, val_metadata);
+
+        // Respond to PFN
+        send_next_network_msg(&mut vfn, pfn_vfn_network).await;
+        vfn.assert_txns_in_mempool(&vfn_txns);
+
+        // Forward to VAL
+        send_next_network_msg(&mut vfn, vfn_val_network).await;
+        vfn
+    };
+
+    let val_future = async move {
+        // Respond to VFN
+        send_next_network_msg(&mut val, vfn_val_network).await;
+        val.assert_txns_in_mempool(&val_txns);
+        val
+    };
+
+    let _ = block_on(futures::future::join3(pfn_future, vfn_future, val_future));
 }
 
 #[test]
 fn drop_msg_test() {
-    let owner_1 = 0;
-    let owner_2 = 1;
     let mut test_framework: MempoolTestFramework = TestFrameworkBuilder::new()
         .add_owners(2)
-        .add_validator(owner_1)
-        .add_validator(owner_2)
+        .add_validator(0)
+        .add_validator(1)
         .build();
+    let mut sender = test_framework.take_node(NodeId::validator(0));
+    let mut receiver = test_framework.take_node(NodeId::validator(1));
+    let network_id = sender.find_common_network(&receiver).unwrap();
+    let receiver_metadata = receiver.conn_metadata(network_id, ConnectionOrigin::Outbound, None);
 
-    let v1 = NodeId::validator(owner_1);
-    let v2 = NodeId::validator(owner_2);
-    let test_txns = test_transactions(0, 3);
-    test_framework.connect(v1, v2);
-    let future = async move {
-        test_framework
-            .node_mut(v1)
-            .add_txns_via_client(&test_txns)
-            .await;
-        // Drop first try
-        test_framework.drop_msg(v1, NetworkId::Validator).await;
-        test_framework
-            .node(v2)
-            .assert_txns_not_in_mempool(&test_txns);
+    let sender_test_txns = test_transactions(0, 3);
+    let receiver_test_txns = sender_test_txns.clone();
 
-        // Send first message
-        test_framework.propagate_msg(v1, NetworkId::Validator).await;
-        // But, drop the ack
-        test_framework.drop_msg(v2, NetworkId::Validator).await;
-        test_framework.node(v2).assert_txns_in_mempool(&test_txns);
+    // Mempools should be clean at start
+    sender.assert_txns_not_in_mempool(&sender_test_txns);
+    receiver.assert_txns_not_in_mempool(&sender_test_txns);
 
-        // Try again
-        test_framework.propagate_msg_and_ack(v1, v2).await;
-        // Ensure messages show up
-        let v1_node = test_framework.node(v1);
-        let v2_node = test_framework.node(v2);
-        v1_node.assert_txns_in_mempool(&test_txns);
-        v2_node.assert_txns_in_mempool(&test_txns);
-        v2_node.commit_txns(&test_txns);
+    let sender_future = async move {
+        sender.connect(network_id, receiver_metadata);
+        sender.add_txns_via_client(&sender_test_txns).await;
+        sender.assert_txns_in_mempool(&sender_test_txns);
 
-        v1_node.assert_txns_in_mempool(&test_txns);
-        v2_node.assert_txns_not_in_mempool(&test_txns);
+        // Send the first message
+        send_next_network_msg(&mut sender, network_id).await;
+
+        // Send it again, first ack was dropped
+        send_next_network_msg(&mut sender, network_id).await;
+        sender
     };
 
-    block_on(future)
-}
+    let receiver_future = async move {
+        // Drop first ack (but txns were accepted)
+        drop_next_network_msg(&mut receiver, network_id).await;
+        receiver.assert_txns_in_mempool(&receiver_test_txns);
+        // Send next ack
+        send_next_network_msg(&mut receiver, network_id).await;
+        receiver
+    };
 
+    let _ = block_on(futures::future::join(sender_future, receiver_future));
+}
+/*
 #[test]
 fn drop_connection_test() {
     let owner_1 = 0;
@@ -198,7 +225,7 @@ fn test_waiting_on_txns() {
     let test_txns = vec![txn_1.clone(), test_transaction(2)];
     test_framework.connect(v1, v2);
 
-    let future = async move {
+    let validator_1 = async move {
         test_framework
             .node_mut(v1)
             .add_txns_via_client(&test_txns)
@@ -222,6 +249,8 @@ fn test_waiting_on_txns() {
         test_framework.propagate_msg(v1, NetworkId::Validator).await;
         test_framework.node(v2).assert_txns_in_mempool(&all_txns);
     };
+
+    let validator_2 = async move {};
     block_on(future)
 }
 
@@ -298,6 +327,6 @@ fn update_gas_price_test() {
     };
     block_on(future)
 }
-
+*/
 // TODO: Mempool is full test
 // TODO: Test max broadcast limit
