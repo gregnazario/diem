@@ -37,7 +37,7 @@ pub struct InboundNetworkHandle {
 
 impl InboundNetworkHandle {
     /// Push connection update, and update the local storage
-    fn connect(
+    pub fn connect(
         &self,
         self_peer_id: PeerId,
         network_id: NetworkId,
@@ -59,7 +59,7 @@ impl InboundNetworkHandle {
     }
 
     /// Push disconnect update, and update the local storage
-    fn disconnect(
+    pub fn disconnect(
         &self,
         self_peer_id: PeerId,
         network_id: NetworkId,
@@ -256,9 +256,9 @@ pub trait TestNode {
 
 /// Drops the next queued network message on `Node`'s network (`NetworkId`).  Doesn't propagate
 /// to downstream node
-pub async fn drop_next_network_msg<Node: TestNode>(node: &mut Node, network_id: NetworkId) {
+pub async fn drop_next_network_msg<Node: TestNode>(node: &mut Node, network_id: NetworkId) -> PeerManagerRequest {
     let outbound_receiver = node.outbound_handle(network_id);
-    let _ = outbound_receiver.next().await.expect("Expecting a message");
+    outbound_receiver.next().await.expect("Expecting a message")
 }
 
 /// Sends the next queued network message on `Node`'s network (`NetworkId`)
