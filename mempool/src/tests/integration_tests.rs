@@ -1,20 +1,129 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::tests::{
-    common::TestTransaction,
-    test_framework::{test_transaction, test_transactions, MempoolTestFramework},
+use crate::tests::test_framework::{
+    respond_to_request, send_message,
 };
+use crate::tests::test_framework::{test_transactions, MempoolTestFramework};
+use diem_config::config::PeerRole;
+use diem_config::network_id::NetworkId;
+use diem_types::PeerId;
 use futures::executor::block_on;
 use netcore::transport::ConnectionOrigin;
-use network::testutils::test_node::drop_next_network_msg;
 use network::testutils::{
     builder::TestFrameworkBuilder,
     test_framework::TestFramework,
-    test_node::{send_next_network_msg, NodeId, TestNode},
+    test_node::{drop_next_network_msg, send_next_network_msg, NodeId, TestNode},
 };
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use network::transport::ConnectionMetadata;
+use network::ProtocolId;
+use network::protocols::wire::handshake::v1::ProtocolIdSet;
+
+#[test]
+fn single_node_test() {
+    let mut test_framework: MempoolTestFramework = TestFrameworkBuilder::new()
+        .add_owners(1)
+        .add_validator(0)
+        .build();
+    let mut node = test_framework.take_node(NodeId::validator(0));
+    let network_id = NetworkId::Validator;
+    let other_peer_id = PeerId::random();
+    let mut metadata = ConnectionMetadata::mock_with_role_and_origin(
+        other_peer_id,
+        PeerRole::Validator,
+        ConnectionOrigin::Outbound,
+    );
+    metadata.application_protocols = ProtocolIdSet::all_known();
+    let future = async move {
+        let test_txns = test_transactions(0, 1);
+        let inbound_handle = node.node_inbound_handle(network_id);
+        node.add_txns_via_client(&test_txns).await;
+
+        // After we connect, we should try to send messages to it
+        inbound_handle.connect(
+            node.peer_network_id(network_id).peer_id(),
+            network_id,
+            metadata,
+        );
+
+        // Respond and at this point, all txns should be good to go
+        respond_to_request(&mut node, network_id, other_peer_id, &test_txns).await;
+        let test_txns = test_transactions(1, 1);
+        node.add_txns_via_client(&test_txns).await;
+        node.assert_txns_in_mempool(&test_transactions(0, 2));
+        respond_to_request(&mut node, network_id, other_peer_id, &test_txns).await;
+
+        // Let's also send it an incoming request with more txns and respond with an ack (DirectSend & RPC)
+        send_message(
+            &mut node,
+            ProtocolId::MempoolRpc,
+            network_id,
+            other_peer_id,
+            &test_transactions(2, 1),
+        )
+        .await;
+        node.assert_txns_in_mempool(&test_transactions(0, 3));
+        send_message(
+            &mut node,
+            ProtocolId::MempoolDirectSend,
+            network_id,
+            other_peer_id,
+            &test_transactions(3, 1),
+        )
+        .await;
+        node.assert_txns_in_mempool(&test_transactions(0, 4));
+    };
+    block_on(future);
+}
+
+#[test]
+fn vfn_middle_man_test() {
+    let mut test_framework: MempoolTestFramework = TestFrameworkBuilder::new()
+        .add_owners(1)
+        .add_vfn(0)
+        .build();
+    let mut node = test_framework.take_node(NodeId::vfn(0));
+    let validator_peer_id = PeerId::random();
+    let mut validator_metadata = ConnectionMetadata::mock_with_role_and_origin(
+        validator_peer_id,
+        PeerRole::Validator,
+        ConnectionOrigin::Outbound,
+    );
+    validator_metadata.application_protocols = ProtocolIdSet::all_known();
+
+    let fn_peer_id = PeerId::random();
+    let mut fn_metadata = ConnectionMetadata::mock_with_role_and_origin(
+        fn_peer_id,
+        PeerRole::Unknown,
+        ConnectionOrigin::Inbound,
+    );
+    fn_metadata.application_protocols = ProtocolIdSet::all_known();
+
+    let future = async move {
+        let test_txns = test_transactions(0, 2);
+        let inbound_handle = node.node_inbound_handle(NetworkId::Vfn);
+        // Connect upstream Validator and downstream FN
+        inbound_handle.connect(
+            node.peer_network_id(NetworkId::Vfn).peer_id(),
+            NetworkId::Vfn,
+            validator_metadata,
+        );
+        let inbound_handle = node.node_inbound_handle(NetworkId::Public);
+        inbound_handle.connect(
+            node.peer_network_id(NetworkId::Public).peer_id(),
+            NetworkId::Public,
+            fn_metadata,
+        );
+
+        // Incoming transactions should be accepted
+        send_message(&mut node, ProtocolId::MempoolRpc, NetworkId::Public, fn_peer_id, &test_txns).await;
+        node.assert_txns_in_mempool(&test_txns);
+
+        // And they should be forwarded upstream
+        respond_to_request(&mut node, NetworkId::Vfn, validator_peer_id, &test_txns).await;
+    };
+    block_on(future);
+}
 
 #[test]
 fn basic_send_txns_validator_test() {
@@ -31,6 +140,7 @@ fn basic_send_txns_validator_test() {
 
     let sender_test_txns = test_transactions(0, 3);
     let receiver_test_txns = sender_test_txns.clone();
+    let text_txns = sender_test_txns.clone();
 
     // Mempools should be clean at start
     sender.assert_txns_not_in_mempool(&sender_test_txns);
@@ -50,13 +160,10 @@ fn basic_send_txns_validator_test() {
         sender
     };
 
-    let receiver_future = async move {
-        send_next_network_msg(&mut receiver, network_id).await;
-        receiver.assert_txns_in_mempool(&receiver_test_txns);
-        receiver
-    };
+    let receiver_future = async move { receiver };
 
-    let _ = block_on(futures::future::join(sender_future, receiver_future));
+    let (sender, receiver) = block_on(futures::future::join(sender_future, receiver_future));
+    receiver.assert_txns_in_mempool(&text_txns);
 }
 
 #[test]
