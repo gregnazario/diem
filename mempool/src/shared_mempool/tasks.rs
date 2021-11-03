@@ -37,13 +37,16 @@ use std::{
 };
 use tokio::runtime::Handle;
 use vm_validator::vm_validator::{get_account_sequence_number, TransactionValidation};
+use network::protocols::network::RpcError;
+use network::ProtocolId;
+use bytes::Bytes;
 
 // ============================== //
 //  broadcast_coordinator tasks  //
 // ============================== //
 
 /// Attempts broadcast to `peer` and schedules the next broadcast.
-pub(crate) fn execute_broadcast<V>(
+pub(crate) async fn execute_broadcast<V>(
     peer: PeerNetworkId,
     backoff: bool,
     smp: &mut SharedMempool<V>,
@@ -55,7 +58,7 @@ pub(crate) fn execute_broadcast<V>(
     let network_interface = &smp.network_interface.clone();
     // If there's no connection, don't bother to broadcast
     if network_interface.app_data().read(&peer).is_some() {
-        network_interface.execute_broadcast(peer, backoff, smp);
+        network_interface.execute_broadcast(peer, backoff, smp).await;
     } else {
         // Drop the scheduled broadcast, we're not connected anymore
         return;
@@ -137,6 +140,7 @@ pub(crate) async fn process_transaction_broadcast<V>(
     timeline_state: TimelineState,
     peer: PeerNetworkId,
     timer: HistogramTimer,
+    maybe_rpc_sender: Option<oneshot::Sender<Result<Bytes, RpcError>>>,
 ) where
     V: TransactionValidation,
 {
@@ -149,16 +153,23 @@ pub(crate) async fn process_transaction_broadcast<V>(
     log_txn_process_results(&results, Some(peer));
 
     let ack_response = gen_ack_response(request_id, results, &peer);
-    let network_sender = smp.network_interface.sender();
-    if let Err(e) = network_sender.send_to(peer, ack_response) {
-        counters::network_send_fail_inc(counters::ACK_TXNS);
-        error!(
+
+    if let Some(rpc_sender) = maybe_rpc_sender {
+        let network_sender = smp.network_interface.sender();
+        let _ = network_sender.send_rpc(peer, ack_response, Duration::from_secs(2)).await;
+    } else {
+        let network_sender = smp.network_interface.sender();
+        if let Err(e) = network_sender.send_to(peer, ack_response) {
+            counters::network_send_fail_inc(counters::ACK_TXNS);
+            error!(
             LogSchema::event_log(LogEntry::BroadcastACK, LogEvent::NetworkSendFail)
                 .peer(&peer)
                 .error(&e.into())
         );
-        return;
+            return;
+        }
     }
+
     notify_subscribers(SharedMempoolNotification::ACK, &smp.subscribers);
 }
 

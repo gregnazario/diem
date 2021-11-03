@@ -82,7 +82,7 @@ pub(crate) async fn coordinator<V>(
                 handle_mempool_reconfig_event(&mut smp, &bounded_executor, reconfig_notification.on_chain_configs).await;
             },
             (peer, backoff) = scheduled_broadcasts.select_next_some() => {
-                tasks::execute_broadcast(peer, backoff, &mut smp, &mut scheduled_broadcasts, executor.clone());
+                tasks::execute_broadcast(peer, backoff, &mut smp, &mut scheduled_broadcasts, executor.clone()).await;
             },
             (network_id, event) = events.select_next_some() => {
                 handle_network_event(&executor, &bounded_executor, &mut scheduled_broadcasts, &mut smp, network_id, event).await;
@@ -245,7 +245,7 @@ async fn handle_network_event<V>(
                 .is_upstream_peer(is_upstream_peer));
             notify_subscribers(SharedMempoolNotification::PeerStateChange, &smp.subscribers);
             if is_new_peer && is_upstream_peer {
-                tasks::execute_broadcast(peer, false, smp, scheduled_broadcasts, executor.clone());
+                tasks::execute_broadcast(peer, false, smp, scheduled_broadcasts, executor.clone()).await;
             }
         }
         Event::LostPeer(metadata) => {
@@ -293,6 +293,7 @@ async fn handle_network_event<V>(
                             timeline_state,
                             peer,
                             task_start_timer,
+                            None,
                         ))
                         .await;
                 }
@@ -312,13 +313,61 @@ async fn handle_network_event<V>(
                 }
             }
         }
-        Event::RpcRequest(peer_id, _msg, _, _res_tx) => {
-            counters::unexpected_msg_count_inc(&network_id, &peer_id);
-            sample!(
-                SampleRate::Duration(Duration::from_secs(60)),
-                warn!(LogSchema::new(LogEntry::UnexpectedNetworkMsg)
-                    .peer(&PeerNetworkId::new(network_id, peer_id)))
-            );
+        Event::RpcRequest(peer_id, msg, protocol_id, res_tx) => {
+            match msg {
+                MempoolSyncMsg::BroadcastTransactionsRequest {
+                    request_id,
+                    transactions,
+                } => {
+                    let response = MempoolSyncMsg::BroadcastTransactionsResponse {request_id: request_id.clone(), backoff: false, retry: false};
+                    //res_tx.send(Ok(protocol_id.to_bytes(&response).unwrap().into()));
+
+                    let smp_clone = smp.clone();
+                    let peer = PeerNetworkId::new(network_id, peer_id);
+                    let timeline_state = match smp.network_interface.is_upstream_peer(&peer, None) {
+                        true => TimelineState::NonQualified,
+                        false => TimelineState::NotReady,
+                    };
+                    // This timer measures how long it took for the bounded executor to
+                    // *schedule* the task.
+                    let _timer = counters::task_spawn_latency_timer(
+                        counters::PEER_BROADCAST_EVENT_LABEL,
+                        counters::SPAWN_LABEL,
+                    );
+                    // This timer measures how long it took for the task to go from scheduled
+                    // to started.
+                    let task_start_timer = counters::task_spawn_latency_timer(
+                        counters::PEER_BROADCAST_EVENT_LABEL,
+                        counters::START_LABEL,
+                    );
+
+                    bounded_executor
+                        .spawn(tasks::process_transaction_broadcast(
+                            smp_clone,
+                            transactions,
+                            request_id,
+                            timeline_state,
+                            peer,
+                            task_start_timer,
+                            Some(res_tx),
+                        ))
+                        .await;
+                }
+                MempoolSyncMsg::BroadcastTransactionsResponse {
+                    request_id,
+                    retry,
+                    backoff,
+                } => {
+                    let ack_timestamp = SystemTime::now();
+                    smp.network_interface.process_broadcast_ack(
+                        PeerNetworkId::new(network_id, peer_id),
+                        request_id,
+                        retry,
+                        backoff,
+                        ack_timestamp,
+                    );
+                }
+            }
         }
     }
 }

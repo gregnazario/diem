@@ -204,7 +204,7 @@ fn test_waiting_on_txns() {
             .add_txns_via_client(&test_txns)
             .await;
         // Send first message
-        test_framework.propagate_msg_and_ack(v1, v2).await;
+        test_framework.propagate_msg(v1, NetworkId::Validator).await;
 
         // Only the first txn should make it
         test_framework
@@ -219,7 +219,7 @@ fn test_waiting_on_txns() {
             .add_txns_via_client(&[test_transaction(1)])
             .await;
         test_framework.node(v1).assert_txns_in_mempool(&all_txns);
-        test_framework.propagate_msg_and_ack(v1, v2).await;
+        test_framework.propagate_msg(v1, NetworkId::Validator).await;
         test_framework.node(v2).assert_txns_in_mempool(&all_txns);
     };
     block_on(future)

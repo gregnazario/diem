@@ -319,11 +319,11 @@ impl MempoolTestFramework {
             .unwrap()
             .incoming_message_sender;
 
-        if maybe_rpc.is_some()
-            && matches!(msg, MempoolSyncMsg::BroadcastTransactionsResponse { .. })
-        {
-            panic!("Can't receive response via RPC")
-        }
+        //if maybe_rpc.is_some()
+        //    && matches!(msg, MempoolSyncMsg::BroadcastTransactionsResponse { .. })
+        //{
+        //    panic!("Can't receive response via RPC")
+        //}
 
         let sender_peer_id = sender_peer_network_id.peer_id();
         if let Some((_timeout, res_tx)) = maybe_rpc {
