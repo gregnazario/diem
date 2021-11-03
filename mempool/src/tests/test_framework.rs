@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use futures::{channel::oneshot, SinkExt, StreamExt};
+use futures::{channel::oneshot, SinkExt};
 use tokio::runtime::Runtime;
 
 use diem_config::{
@@ -20,24 +20,23 @@ use diem_types::{
 };
 use event_notifications::EventSubscriptionService;
 use mempool_notifications::MempoolNotifier;
-use network::{
-    application::storage::PeerMetadataStorage,
-    peer_manager::{PeerManagerNotification, PeerManagerRequest},
-    protocols::{direct_send::Message, rpc::InboundRpcRequest},
-};
+use network::application::storage::PeerMetadataStorage;
 use storage_interface::{mock::MockDbReaderWriter, DbReaderWriter};
 use vm_validator::mocks::mock_vm_validator::MockVMValidator;
 
 use crate::{
     core_mempool::CoreMempool,
-    network::{MempoolNetworkEvents, MempoolNetworkSender, MempoolSyncMsg},
+    network::{MempoolNetworkEvents, MempoolNetworkSender},
     shared_mempool::start_shared_mempool,
     tests::common::TestTransaction,
     ConsensusRequest, MempoolClientRequest, MempoolClientSender,
 };
 use network::testutils::{
     test_framework::{setup_node_networks, TestFramework},
-    test_node::{ApplicationNetworkHandle, NodeId, NodeNetworkHandle, NodeType, TestNode},
+    test_node::{
+        ApplicationNetworkHandle, InboundNetworkHandle, NodeId, NodeType, OutboundMessageReceiver,
+        TestNode,
+    },
 };
 
 pub type MempoolConsensusSender = futures::channel::mpsc::Sender<ConsensusRequest>;
@@ -57,7 +56,9 @@ pub struct MempoolNode {
     pub mempool_consensus_sender: MempoolConsensusSender,
     pub mempool_notifications: MempoolNotifier,
 
-    pub node_network_handles: HashMap<NetworkId, NodeNetworkHandle>,
+    pub inbound_handles: HashMap<NetworkId, InboundNetworkHandle>,
+    pub outbound_handles: HashMap<NetworkId, OutboundMessageReceiver>,
+    pub other_inbound_handles: HashMap<PeerNetworkId, InboundNetworkHandle>,
     pub peer_metadata_storage: Arc<PeerMetadataStorage>,
 }
 
@@ -72,16 +73,43 @@ impl TestNode for MempoolNode {
         self.node_id
     }
 
-    fn node_network_handles(&self) -> &HashMap<NetworkId, NodeNetworkHandle> {
-        &self.node_network_handles
-    }
-
-    fn node_network_handles_mut(&mut self) -> &mut HashMap<NetworkId, NodeNetworkHandle> {
-        &mut self.node_network_handles
-    }
-
     fn node_type(&self) -> NodeType {
         self.node_id.node_type
+    }
+
+    fn node_inbound_handle(&self, network_id: NetworkId) -> InboundNetworkHandle {
+        self.inbound_handles
+            .get(&network_id)
+            .expect("Must have inbound handle for network")
+            .clone()
+    }
+
+    fn add_other_inbound_handle(
+        &mut self,
+        peer_network_id: PeerNetworkId,
+        handle: InboundNetworkHandle,
+    ) {
+        if self
+            .other_inbound_handles
+            .insert(peer_network_id, handle)
+            .is_some()
+        {
+            panic!(
+                "Double added handle for {} on {}",
+                peer_network_id, self.node_id
+            )
+        }
+    }
+
+    fn other_inbound_handle(&self, peer_network_id: PeerNetworkId) -> InboundNetworkHandle {
+        self.other_inbound_handles
+            .get(&peer_network_id)
+            .expect("Must have inbound handle for other peer")
+            .clone()
+    }
+
+    fn outbound_handle(&mut self, network_id: NetworkId) -> &mut OutboundMessageReceiver {
+        self.outbound_handles.get_mut(&network_id).unwrap()
     }
 
     fn peer_metadata_storage(&self) -> &PeerMetadataStorage {
@@ -157,22 +185,11 @@ impl MempoolNode {
 
 pub struct MempoolTestFramework {
     pub nodes: HashMap<NodeId, MempoolNode>,
-    pub peer_network_id_to_node: HashMap<PeerNetworkId, NodeId>,
 }
 
 impl TestFramework<MempoolNode> for MempoolTestFramework {
-    fn new(
-        nodes: HashMap<NodeId, MempoolNode>,
-        peer_network_id_to_node: HashMap<PeerNetworkId, NodeId>,
-    ) -> Self {
-        Self {
-            nodes,
-            peer_network_id_to_node,
-        }
-    }
-
-    fn nodes(&self) -> &HashMap<NodeId, MempoolNode> {
-        &self.nodes
+    fn new(nodes: HashMap<NodeId, MempoolNode>) -> Self {
+        Self { nodes }
     }
 
     fn nodes_mut(&mut self) -> &mut HashMap<NodeId, MempoolNode> {
@@ -198,12 +215,13 @@ impl TestFramework<MempoolNode> for MempoolTestFramework {
         }
         let runtime = node_runtime(node_id);
 
-        let (reqs_handles, node_network_handles, peer_metadata) = setup_node_networks(&network_ids);
+        let (application_handles, inbound_handles, outbound_handles, peer_metadata_storage) =
+            setup_node_networks(&network_ids);
         let (mempool_client_sender, mempool_consensus_sender, mempool_notifications, mempool) =
             setup_mempool(
                 config.clone(),
-                reqs_handles,
-                peer_metadata.clone(),
+                application_handles,
+                peer_metadata_storage.clone(),
                 &runtime,
             );
 
@@ -217,8 +235,10 @@ impl TestFramework<MempoolNode> for MempoolTestFramework {
             mempool_client_sender,
             mempool_consensus_sender,
             mempool_notifications,
-            node_network_handles,
-            peer_metadata_storage: peer_metadata,
+            inbound_handles,
+            outbound_handles,
+            other_inbound_handles: HashMap::new(),
+            peer_metadata_storage,
         }
     }
 }
@@ -269,92 +289,6 @@ fn setup_mempool(
         mempool_notifier,
         mempool,
     )
-}
-
-impl MempoolTestFramework {
-    pub async fn drop_msg(&mut self, sender_id: NodeId, network_id: NetworkId) {
-        let sender = self.node_mut(sender_id);
-        let network_handle = sender.node_network_handles.get_mut(&network_id).unwrap();
-        let _ = network_handle.outgoing_messages.next().await;
-    }
-
-    pub async fn propagate_msg_and_ack(&mut self, sender_id: NodeId, receiver_id: NodeId) {
-        let network_id = self.find_common_network(sender_id, receiver_id);
-        self.propagate_msg(sender_id, network_id).await;
-        self.propagate_msg(receiver_id, network_id).await;
-    }
-
-    pub async fn propagate_msg(&mut self, sender_id: NodeId, network_id: NetworkId) {
-        let sender = self.node_mut(sender_id);
-
-        let network_handle = sender.node_network_handles.get_mut(&network_id).unwrap();
-        let maybe_request = network_handle.outgoing_messages.next().await;
-        let (peer_id, protocol_id, data, maybe_rpc) = if let Some(request) = maybe_request {
-            match request {
-                PeerManagerRequest::SendRpc(peer_id, msg) => (
-                    peer_id,
-                    msg.protocol_id,
-                    msg.data,
-                    Some((msg.timeout, msg.res_tx)),
-                ),
-                PeerManagerRequest::SendDirectSend(peer_id, msg) => {
-                    (peer_id, msg.protocol_id, msg.mdata, None)
-                }
-            }
-        } else {
-            panic!("Expected a message to propagate")
-        };
-
-        let msg: MempoolSyncMsg = protocol_id.from_bytes(&data).unwrap();
-        let sender_peer_network_id = self.node(sender_id).peer_network_id(network_id);
-        let receiver_peer_network_id = PeerNetworkId::new(network_id, peer_id);
-        let receiver_id = *self
-            .peer_network_id_to_node
-            .get(&receiver_peer_network_id)
-            .unwrap();
-        let receiver = self.node_mut(receiver_id);
-        let incoming_message_sender = &receiver
-            .node_network_handles
-            .get(&network_id)
-            .unwrap()
-            .incoming_message_sender;
-
-        //if maybe_rpc.is_some()
-        //    && matches!(msg, MempoolSyncMsg::BroadcastTransactionsResponse { .. })
-        //{
-        //    panic!("Can't receive response via RPC")
-        //}
-
-        let sender_peer_id = sender_peer_network_id.peer_id();
-        if let Some((_timeout, res_tx)) = maybe_rpc {
-            incoming_message_sender
-                .push(
-                    (sender_peer_id, protocol_id),
-                    PeerManagerNotification::RecvRpc(
-                        sender_peer_id,
-                        InboundRpcRequest {
-                            protocol_id,
-                            data,
-                            res_tx,
-                        },
-                    ),
-                )
-                .unwrap()
-        } else {
-            incoming_message_sender
-                .push(
-                    (sender_peer_id, protocol_id),
-                    PeerManagerNotification::RecvMessage(
-                        sender_peer_id,
-                        Message {
-                            protocol_id,
-                            mdata: data,
-                        },
-                    ),
-                )
-                .unwrap()
-        }
-    }
 }
 
 fn node_runtime(node_id: NodeId) -> Arc<Runtime> {
