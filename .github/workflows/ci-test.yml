@@ -36,7 +36,7 @@ jobs:
       test-docker-compose: ${{ steps.docker-compose-changes.outputs.changes-found }}
       test-test-coverage: ${{ steps.test-coverage.outputs.changes-found }}
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           # This ensures that the tip of the PR is checked out instead of the merge between the base ref and the tip
           # On `push` this value will be empty and will "do-the-right-thing"
@@ -151,7 +151,7 @@ jobs:
       matrix:
         target_os: [alpine, arch, github]
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - name: build image with dev-setup.sh
@@ -175,7 +175,7 @@ jobs:
         target_images:
           [client faucet cluster-test forge, init tools validator validator-tcb]
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           fetch-depth: 0 #get all the history!!!
       - id: changes
@@ -244,7 +244,7 @@ jobs:
       # The last matrix build to succeed will set the output.   Hilarious.
       prev-tag: ${{ steps.build-extra-images.outputs.prev-tag }}
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0 #get all the history!!!
@@ -313,7 +313,7 @@ jobs:
     if: ${{ always() && needs.build-images.result=='success' && needs.prepare.outputs.test-land-blocking == 'true' }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           # This ensures that the tip of the PR is checked out instead of the merge between the base ref and the tip
           # On `push` this value will be empty and will "do-the-right-thing"
@@ -499,7 +499,7 @@ jobs:
       #container:
       #image: diem/build_environment:${{ needs.prepare.outputs.changes-target-branch }}
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: ./.github/actions/build-setup
@@ -531,7 +531,7 @@ jobs:
       #volumes:
       #  - "${{github.workspace}}:/opt/git/diem"
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: ./.github/actions/build-setup
@@ -563,7 +563,7 @@ jobs:
       #volumes:
       #  - "${{github.workspace}}:/opt/git/diem"
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0 #get all the history!!!
@@ -609,7 +609,7 @@ jobs:
       #volumes:
       #  - "${{github.workspace}}:/opt/git/diem"
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0 #get all the history!!!
@@ -654,7 +654,7 @@ jobs:
       FLAKY_TESTS_FILE: /tmp/failures
       MESSAGE_PAYLOAD_FILE: /tmp/message
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0 #get all the history!!!
@@ -732,7 +732,7 @@ jobs:
       #volumes:
       #  - "${{github.workspace}}:/opt/git/diem"
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0 #get all the history!!!
@@ -758,7 +758,7 @@ jobs:
     needs: prepare
     if: ${{ needs.prepare.outputs.test-docker-compose == 'true' }}
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - name: install expect
@@ -781,7 +781,7 @@ jobs:
         env:
           JSON_RPC_URL: "http://127.0.0.1:8080"
           FAUCET_URL: "http://127.0.0.1:8000"
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: diem-core-v1.2.0
       # Unfortunately this is spelled wrong in the release branch
@@ -807,7 +807,7 @@ jobs:
       #volumes:
       #  - "${{github.workspace}}:/opt/git/diem"
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: ./.github/actions/build-setup
@@ -835,7 +835,7 @@ jobs:
       #volumes:
       #  - "${{github.workspace}}:/opt/git/diem"
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: ./.github/actions/build-setup
@@ -864,7 +864,7 @@ jobs:
     needs: prepare
     if: ${{ needs.prepare.outputs.test-helm == 'true' }}
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - name: Check machine details for minikube
@@ -943,7 +943,7 @@ jobs:
       #volumes:
       #  - "${{github.workspace}}:/opt/git/diem"
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: ./.github/actions/build-setup
@@ -971,7 +971,7 @@ jobs:
       #volumes:
       #  - "${{github.workspace}}:/opt/git/diem"
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: ./.github/actions/build-setup
@@ -1000,7 +1000,7 @@ jobs:
     env:
       CRITERION_HOME: /tmp/benches
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/cache@v2.1.6
@@ -1036,7 +1036,7 @@ jobs:
     needs:
       - prepare
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - name: Use Node.js 14
@@ -1079,7 +1079,7 @@ jobs:
     if: ${{ needs.prepare.outputs.test-website-build == 'true' }}
     steps:
       # Checks-out the Diem website repository under $GITHUB_WORKSPACE, so job can access it
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/cache@v2.1.6
@@ -1121,7 +1121,7 @@ jobs:
       forge-result: ${{ steps.post-test-result.outputs.forge-result }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v2.3.4
+      - uses: actions/checkout@v2.4.0
         with:
           # This ensures that the tip of the PR is checked out instead of the merge between the base ref and the tip
           # On `push` this value will be empty and will "do-the-right-thing"
