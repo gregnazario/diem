@@ -14,6 +14,7 @@ use crate::{
     ConsensusRequest, ConsensusResponse, SubmissionStatus,
 };
 use anyhow::Result;
+use bytes::Bytes;
 use diem_config::network_id::PeerNetworkId;
 use diem_crypto::HashValue;
 use diem_infallible::{Mutex, RwLock};
@@ -26,7 +27,7 @@ use diem_types::{
     vm_status::DiscardedVMStatus,
 };
 use futures::{channel::oneshot, stream::FuturesUnordered};
-use network::application::interface::NetworkInterface;
+use network::{application::interface::NetworkInterface, protocols::network::RpcError, ProtocolId};
 use rayon::prelude::*;
 use short_hex_str::AsShortHexStr;
 use std::{
@@ -37,9 +38,6 @@ use std::{
 };
 use tokio::runtime::Handle;
 use vm_validator::vm_validator::{get_account_sequence_number, TransactionValidation};
-use network::protocols::network::RpcError;
-use network::ProtocolId;
-use bytes::Bytes;
 
 // ============================== //
 //  broadcast_coordinator tasks  //
@@ -58,7 +56,9 @@ pub(crate) async fn execute_broadcast<V>(
     let network_interface = &smp.network_interface.clone();
     // If there's no connection, don't bother to broadcast
     if network_interface.app_data().read(&peer).is_some() {
-        network_interface.execute_broadcast(peer, backoff, smp).await;
+        network_interface
+            .execute_broadcast(peer, backoff, smp)
+            .await;
     } else {
         // Drop the scheduled broadcast, we're not connected anymore
         return;
@@ -155,17 +155,16 @@ pub(crate) async fn process_transaction_broadcast<V>(
     let ack_response = gen_ack_response(request_id, results, &peer);
 
     if let Some(rpc_sender) = maybe_rpc_sender {
-        let network_sender = smp.network_interface.sender();
-        let _ = network_sender.send_rpc(peer, ack_response, Duration::from_secs(2)).await;
+        let bytes = ProtocolId::MempoolRpc.to_bytes(&ack_response).unwrap();
+        rpc_sender.send(Ok(bytes.into())).unwrap();
     } else {
-        let network_sender = smp.network_interface.sender();
-        if let Err(e) = network_sender.send_to(peer, ack_response) {
+        if let Err(e) = smp.network_interface.sender().send_to(peer, ack_response) {
             counters::network_send_fail_inc(counters::ACK_TXNS);
             error!(
-            LogSchema::event_log(LogEntry::BroadcastACK, LogEvent::NetworkSendFail)
-                .peer(&peer)
-                .error(&e.into())
-        );
+                LogSchema::event_log(LogEntry::BroadcastACK, LogEvent::NetworkSendFail)
+                    .peer(&peer)
+                    .error(&e.into())
+            );
             return;
         }
     }

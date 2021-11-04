@@ -245,7 +245,8 @@ async fn handle_network_event<V>(
                 .is_upstream_peer(is_upstream_peer));
             notify_subscribers(SharedMempoolNotification::PeerStateChange, &smp.subscribers);
             if is_new_peer && is_upstream_peer {
-                tasks::execute_broadcast(peer, false, smp, scheduled_broadcasts, executor.clone()).await;
+                tasks::execute_broadcast(peer, false, smp, scheduled_broadcasts, executor.clone())
+                    .await;
             }
         }
         Event::LostPeer(metadata) => {
@@ -313,15 +314,12 @@ async fn handle_network_event<V>(
                 }
             }
         }
-        Event::RpcRequest(peer_id, msg, protocol_id, res_tx) => {
+        Event::RpcRequest(peer_id, msg, _protocol_id, res_tx) => {
             match msg {
                 MempoolSyncMsg::BroadcastTransactionsRequest {
                     request_id,
                     transactions,
                 } => {
-                    let response = MempoolSyncMsg::BroadcastTransactionsResponse {request_id: request_id.clone(), backoff: false, retry: false};
-                    //res_tx.send(Ok(protocol_id.to_bytes(&response).unwrap().into()));
-
                     let smp_clone = smp.clone();
                     let peer = PeerNetworkId::new(network_id, peer_id);
                     let timeline_state = match smp.network_interface.is_upstream_peer(&peer, None) {

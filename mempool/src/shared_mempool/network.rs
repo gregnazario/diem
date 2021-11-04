@@ -438,24 +438,35 @@ impl MempoolNetworkInterface {
 
         let num_txns = transactions.len();
         // FIXME support direct send in tandem
-        match network_sender.send_rpc(peer, MempoolSyncMsg::BroadcastTransactionsRequest {
-            request_id: bcs::to_bytes(&batch_id).expect("failed BCS serialization of batch ID"),
-            transactions,
-        }, Duration::from_secs(0)).await {
-            Ok(MempoolSyncMsg::BroadcastTransactionsResponse {request_id, retry, backoff}) => {
-                self.process_broadcast_ack(peer, request_id, retry, backoff, SystemTime::now())
-            },
+        let maybe_response = match network_sender
+            .send_rpc(
+                peer,
+                MempoolSyncMsg::BroadcastTransactionsRequest {
+                    request_id: bcs::to_bytes(&batch_id)
+                        .expect("failed BCS serialization of batch ID"),
+                    transactions,
+                },
+                Duration::from_secs(0),
+            )
+            .await
+        {
+            Ok(MempoolSyncMsg::BroadcastTransactionsResponse {
+                request_id,
+                retry,
+                backoff,
+            }) => Some((request_id, retry, backoff)),
             Ok(_) => panic!("Recieved a Request on an RPC response"),
             Err(e) => {
                 counters::network_send_fail_inc(counters::BROADCAST_TXNS);
-                error!(
-                LogSchema::event_log(LogEntry::BroadcastTransaction, LogEvent::NetworkSendFail)
-                    .peer(&peer)
-                    .error(&e.into())
-            );
+                error!(LogSchema::event_log(
+                    LogEntry::BroadcastTransaction,
+                    LogEvent::NetworkSendFail
+                )
+                .peer(&peer)
+                .error(&e.into()));
                 return;
             }
-        }
+        };
 
         let mut sync_states = self.sync_states.write_lock();
         let state = if let Some(state) = sync_states.get_mut(&peer) {
@@ -475,6 +486,14 @@ impl MempoolNetworkInterface {
         state.broadcast_info.retry_batches.remove(&batch_id);
         notify_subscribers(SharedMempoolNotification::Broadcast, &smp.subscribers);
 
+        let num_pending_broadcasts = state.broadcast_info.sent_batches.len();
+
+        // Drop this so we can process the broadcast ack
+        drop(sync_states);
+        if let Some((request_id, retry, backoff)) = maybe_response {
+            self.process_broadcast_ack(peer, request_id, retry, backoff, SystemTime::now())
+        }
+
         let latency = start_time.elapsed();
         trace!(
             LogSchema::event_log(LogEntry::BroadcastTransaction, LogEvent::Success)
@@ -488,7 +507,7 @@ impl MempoolNetworkInterface {
             .with_label_values(&[network_id.as_str(), peer_id.as_str()])
             .observe(num_txns as f64);
         counters::shared_mempool_pending_broadcasts(&peer)
-            .set(state.broadcast_info.sent_batches.len() as i64);
+            .set(num_pending_broadcasts as i64);
         counters::SHARED_MEMPOOL_BROADCAST_LATENCY
             .with_label_values(&[network_id.as_str(), peer_id.as_str()])
             .observe(latency.as_secs_f64());
