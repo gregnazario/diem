@@ -16,7 +16,7 @@ use diem_config::{
 use diem_infallible::{Mutex, RwLock};
 use diem_types::{
     mempool_status::MempoolStatusCode, on_chain_config::ON_CHAIN_CONFIG_REGISTRY,
-    transaction::SignedTransaction,
+    transaction::SignedTransaction, PeerId,
 };
 use event_notifications::EventSubscriptionService;
 use mempool_notifications::MempoolNotifier;
@@ -24,6 +24,7 @@ use network::application::storage::PeerMetadataStorage;
 use storage_interface::{mock::MockDbReaderWriter, DbReaderWriter};
 use vm_validator::mocks::mock_vm_validator::MockVMValidator;
 
+use crate::network::MempoolSyncMsg;
 use crate::{
     core_mempool::CoreMempool,
     network::{MempoolNetworkEvents, MempoolNetworkSender},
@@ -31,6 +32,10 @@ use crate::{
     tests::common::TestTransaction,
     ConsensusRequest, MempoolClientRequest, MempoolClientSender,
 };
+use network::peer_manager::{PeerManagerNotification, PeerManagerRequest};
+use network::protocols::direct_send::Message;
+use network::protocols::rpc::InboundRpcRequest;
+use network::testutils::test_node::drop_next_network_msg;
 use network::testutils::{
     test_framework::{setup_node_networks, TestFramework},
     test_node::{
@@ -38,6 +43,8 @@ use network::testutils::{
         TestNode,
     },
 };
+use network::ProtocolId;
+use tokio_stream::StreamExt;
 
 pub type MempoolConsensusSender = futures::channel::mpsc::Sender<ConsensusRequest>;
 
@@ -80,7 +87,7 @@ impl TestNode for MempoolNode {
     fn node_inbound_handle(&self, network_id: NetworkId) -> InboundNetworkHandle {
         self.inbound_handles
             .get(&network_id)
-            .expect("Must have inbound handle for network")
+            .unwrap_or_else( || panic!("Must have inbound handle for network {}", network_id))
             .clone()
     }
 
@@ -124,12 +131,11 @@ impl TestNode for MempoolNode {
 impl MempoolNode {
     /// Queues transactions for sending on a node, uses client
     pub async fn add_txns_via_client(&mut self, txns: &[TestTransaction]) {
-        for txn in txns.iter() {
-            let transaction = txn.make_signed_transaction_with_max_gas_amount(5);
+        for txn in sign_transactions(txns) {
             let (sender, receiver) = oneshot::channel();
 
             self.mempool_client_sender
-                .send(MempoolClientRequest::SubmitTransaction(transaction, sender))
+                .send(MempoolClientRequest::SubmitTransaction(txn, sender))
                 .await
                 .unwrap();
             let status = receiver.await.unwrap().unwrap();
@@ -155,25 +161,18 @@ impl MempoolNode {
 
     pub fn assert_txns_in_mempool(&self, txns: &[TestTransaction]) {
         let block = self.mempool.lock().get_block(100, HashSet::new());
-        if !txns
-            .iter()
-            .all(|txn| block_contains_test_transaction(&block, txn))
-        {
+        if !block_contains_only_test_transactions(&block, txns) {
             let txns: Vec<_> = txns
                 .iter()
                 .map(|txn| (txn.address, txn.sequence_number))
                 .collect();
             panic!("Expected to contain the test transactions {:?}", txns);
         }
-        assert_eq!(block.len(), txns.len());
     }
 
     pub fn assert_txns_not_in_mempool(&self, txns: &[TestTransaction]) {
         let block = self.mempool.lock().get_block(100, HashSet::new());
-        if txns
-            .iter()
-            .any(|txn| block_contains_test_transaction(&block, txn))
-        {
+        if !block_contains_no_test_transactions(&block, txns) {
             let txns: Vec<_> = txns
                 .iter()
                 .map(|txn| (txn.address, txn.sequence_number))
@@ -320,9 +319,165 @@ pub fn test_transactions(start: u64, num: u64) -> Vec<TestTransaction> {
     txns
 }
 
+pub fn block_contains_only_test_transactions(
+    block: &[SignedTransaction],
+    txns: &[TestTransaction],
+) -> bool {
+    txns.iter()
+        .all(|txn| block_contains_test_transaction(&block, txn))
+        && block.len() == txns.len()
+}
+
+pub fn block_contains_no_test_transactions(
+    block: &[SignedTransaction],
+    txns: &[TestTransaction],
+) -> bool {
+    !txns
+        .iter()
+        .any(|txn| block_contains_test_transaction(&block, txn))
+        && block.len() == txns.len()
+}
+
 fn block_contains_test_transaction(block: &[SignedTransaction], txn: &TestTransaction) -> bool {
     block.iter().any(|signed_txn| {
         signed_txn.sequence_number() == txn.sequence_number
             && signed_txn.sender() == TestTransaction::get_address(txn.address)
     })
+}
+
+pub async fn send_message(
+    node: &mut MempoolNode,
+    protocol_id: ProtocolId,
+    network_id: NetworkId,
+    remote_peer_id: PeerId,
+    txns: &[TestTransaction],
+) {
+    let inbound_handle = node.node_inbound_handle(network_id);
+    let request_id = Vec::new();
+    let msg = MempoolSyncMsg::BroadcastTransactionsRequest {
+        request_id,
+        transactions: sign_transactions(txns),
+    };
+    let data = protocol_id.to_bytes(&msg).unwrap().into();
+   let (notif, maybe_receiver) = match protocol_id {
+        ProtocolId::MempoolDirectSend => {
+            (PeerManagerNotification::RecvMessage(remote_peer_id, Message { protocol_id, mdata: data}),
+                None
+                )
+        }
+        ProtocolId::MempoolRpc => {
+            let (res_tx, res_rx) = oneshot::channel();
+            let notif = PeerManagerNotification::RecvRpc(
+                remote_peer_id,
+                InboundRpcRequest {
+                    protocol_id,
+                    data,
+                    res_tx,
+                },
+            );
+            (notif, Some(res_rx))
+        }
+        _ => panic!("Invalid protocol"),
+    };
+    inbound_handle
+        .inbound_message_sender
+        .push((remote_peer_id, protocol_id), notif);
+
+    let response: MempoolSyncMsg = if let Some(res_rx) = maybe_receiver {
+        let response = res_rx.await.unwrap().unwrap();
+        protocol_id.from_bytes(&response).unwrap()
+    } else {
+        match node.outbound_handle(network_id).next().await.unwrap() {
+            PeerManagerRequest::SendDirectSend(peer_id, msg) => {
+                assert_eq!(peer_id, remote_peer_id);
+                msg.protocol_id.from_bytes(&msg.mdata).unwrap()
+            }
+            _ => panic!("Should not be getting an RPC response")
+        }
+    };
+    assert!(matches!(
+        response,
+        MempoolSyncMsg::BroadcastTransactionsResponse {
+            request_id,
+            retry: false,
+            backoff: false
+        }
+    ));
+}
+
+pub async fn respond_to_request(
+    node: &mut MempoolNode,
+    network_id: NetworkId,
+    expected_peer_id: PeerId,
+    expected_txns: &[TestTransaction],
+) {
+    let inbound_handle = node.node_inbound_handle(network_id);
+    let message = drop_next_network_msg(node, network_id).await;
+    let (peer_id, protocol_id, data, maybe_rpc_sender) = match message {
+        PeerManagerRequest::SendRpc(peer_id, msg) => {
+            (peer_id, msg.protocol_id, msg.data, Some(msg.res_tx))
+        }
+        PeerManagerRequest::SendDirectSend(peer_id, msg) => {
+            (peer_id, msg.protocol_id, msg.mdata, None)
+        }
+    };
+    assert_eq!(peer_id, expected_peer_id);
+    let request_id = match protocol_id.from_bytes(&data).unwrap() {
+        MempoolSyncMsg::BroadcastTransactionsRequest {
+            request_id,
+            transactions,
+        } => {
+            if !block_contains_only_test_transactions(&transactions, expected_txns) {
+                let txns: Vec<_> = transactions
+                    .iter()
+                    .map(|txn| (txn.sender(), txn.sequence_number()))
+                    .collect();
+                let expected_txns: Vec<_> = expected_txns
+                    .iter()
+                    .map(|txn| {
+                        (
+                            TestTransaction::get_address(txn.address),
+                            txn.sequence_number,
+                        )
+                    })
+                    .collect();
+
+                panic!(
+                    "Request doesn't match. Actual: {:?} Expected: {:?}",
+                    txns, expected_txns
+                );
+            }
+            request_id
+        }
+        MempoolSyncMsg::BroadcastTransactionsResponse { .. } => {
+            panic!("We aren't supposed to be getting as response here");
+        }
+    };
+    let response = MempoolSyncMsg::BroadcastTransactionsResponse {
+        request_id,
+        retry: false,
+        backoff: false,
+    };
+    let bytes = protocol_id.to_bytes(&response).unwrap();
+
+    if let Some(rpc_sender) = maybe_rpc_sender {
+        let _ = rpc_sender.send(Ok(bytes.clone().into())).unwrap();
+    } else {
+        let notif = PeerManagerNotification::RecvMessage(
+            peer_id,
+            Message {
+                protocol_id,
+                mdata: bytes.into(),
+            },
+        );
+        inbound_handle
+            .inbound_message_sender
+            .push((peer_id, protocol_id), notif);
+    }
+}
+
+pub fn sign_transactions(txns: &[TestTransaction]) -> Vec<SignedTransaction> {
+    txns.iter()
+        .map(|txn| txn.make_signed_transaction_with_max_gas_amount(5))
+        .collect()
 }
