@@ -16,7 +16,7 @@ use network::{
     ProtocolId,
 };
 
-const ALL_PROTOCOLS: [ProtocolId; 1] = [ProtocolId::MempoolDirectSend];
+const ALL_PROTOCOLS: [ProtocolId; 2] = [ProtocolId::MempoolDirectSend, ProtocolId::MempoolRpc];
 
 fn inbound_node_combinations() -> [(MempoolNode, (PeerNetworkId, ConnectionMetadata)); 6] {
     [
@@ -92,6 +92,14 @@ async fn single_inbound_node_test() {
         )
         .await;
         node.assert_only_txns_in_mempool(&all_txns[0..1]);
+
+        node.send_message(
+            ProtocolId::MempoolRpc,
+            other_peer_network_id,
+            &all_txns[1..2],
+        )
+        .await;
+        node.assert_only_txns_in_mempool(&all_txns[0..2]);
     }
 }
 
@@ -137,12 +145,8 @@ async fn vfn_middle_man_test() {
     node.connect_self(fn_peer_network_id.network_id(), fn_metadata);
 
     // Incoming transactions should be accepted
-    node.send_message(
-        ProtocolId::MempoolDirectSend,
-        fn_peer_network_id,
-        &test_txns,
-    )
-    .await;
+    node.send_message(ProtocolId::MempoolRpc, fn_peer_network_id, &test_txns)
+        .await;
     node.assert_only_txns_in_mempool(&test_txns);
 
     // And they should be forwarded upstream
