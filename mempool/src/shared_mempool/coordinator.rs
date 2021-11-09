@@ -36,6 +36,10 @@ use tokio_stream::wrappers::IntervalStream;
 use vm_validator::vm_validator::TransactionValidation;
 
 use super::types::MempoolClientRequest;
+use bytes::Bytes;
+use diem_types::PeerId;
+use futures::channel::oneshot;
+use network::{protocols::network::RpcError, ProtocolId};
 
 /// Coordinator that handles inbound network events and outbound txn broadcasts.
 pub(crate) async fn coordinator<V>(
@@ -222,7 +226,6 @@ async fn handle_mempool_reconfig_event<V>(
 /// - NewPeer events start new automatic broadcasts if the peer is upstream. If the peer is not upstream, we ignore it.
 /// - LostPeer events disable the upstream peer, which will cancel ongoing broadcasts.
 /// - Network messages follow a simple Request/Response framework to accept new transactions
-/// TODO: Move to RPC off of DirectSend
 async fn handle_network_event<V>(
     executor: &Handle,
     bounded_executor: &BoundedExecutor,
@@ -264,62 +267,88 @@ async fn handle_network_event<V>(
         }
         Event::Message(peer_id, msg) => {
             counters::shared_mempool_event_inc("message");
-            match msg {
-                MempoolSyncMsg::BroadcastTransactionsRequest {
-                    request_id,
-                    transactions,
-                } => {
-                    let smp_clone = smp.clone();
-                    let peer = PeerNetworkId::new(network_id, peer_id);
-                    let timeline_state = match smp.network_interface.is_upstream_peer(&peer, None) {
-                        true => TimelineState::NonQualified,
-                        false => TimelineState::NotReady,
-                    };
-                    // This timer measures how long it took for the bounded executor to
-                    // *schedule* the task.
-                    let _timer = counters::task_spawn_latency_timer(
-                        counters::PEER_BROADCAST_EVENT_LABEL,
-                        counters::SPAWN_LABEL,
-                    );
-                    // This timer measures how long it took for the task to go from scheduled
-                    // to started.
-                    let task_start_timer = counters::task_spawn_latency_timer(
-                        counters::PEER_BROADCAST_EVENT_LABEL,
-                        counters::START_LABEL,
-                    );
-                    bounded_executor
-                        .spawn(tasks::process_transaction_broadcast(
-                            smp_clone,
-                            transactions,
-                            request_id,
-                            timeline_state,
-                            peer,
-                            task_start_timer,
-                        ))
-                        .await;
-                }
-                MempoolSyncMsg::BroadcastTransactionsResponse {
-                    request_id,
-                    retry,
-                    backoff,
-                } => {
-                    let ack_timestamp = SystemTime::now();
-                    smp.network_interface.process_broadcast_ack(
-                        PeerNetworkId::new(network_id, peer_id),
-                        request_id,
-                        retry,
-                        backoff,
-                        ack_timestamp,
-                    );
-                }
-            }
+            handle_message(bounded_executor, smp, network_id, peer_id, msg, None).await;
         }
-        Event::RpcRequest(peer_id, _msg, _, _res_tx) => {
-            counters::unexpected_msg_count_inc(&network_id, &peer_id);
-            sample!(
-                SampleRate::Duration(Duration::from_secs(60)),
-                warn!(LogSchema::new(LogEntry::UnexpectedNetworkMsg)
-                    .peer(&PeerNetworkId::new(network_id, peer_id)))
+        Event::RpcRequest(peer_id, msg, protocol_id, res_tx) => {
+            handle_message(
+                bounded_executor,
+                smp,
+                network_id,
+                peer_id,
+                msg,
+                Some((protocol_id, res_tx)),
+            )
+            .await;
+        }
+    }
+}
+
+async fn handle_message<V>(
+    bounded_executor: &BoundedExecutor,
+    smp: &mut SharedMempool<V>,
+    network_id: NetworkId,
+    peer_id: PeerId,
+    msg: MempoolSyncMsg,
+    rpc_info: Option<(ProtocolId, oneshot::Sender<Result<Bytes, RpcError>>)>,
+) where
+    V: TransactionValidation,
+{
+    let peer = PeerNetworkId::new(network_id, peer_id);
+    match msg {
+        MempoolSyncMsg::BroadcastTransactionsRequest {
+            request_id,
+            transactions,
+        } => {
+            let smp_clone = smp.clone();
+            let timeline_state = match smp.network_interface.is_upstream_peer(&peer, None) {
+                true => TimelineState::NonQualified,
+                false => TimelineState::NotReady,
+            };
+            // This timer measures how long it took for the bounded executor to
+            // *schedule* the task.
+            let _timer = counters::task_spawn_latency_timer(
+                counters::PEER_BROADCAST_EVENT_LABEL,
+                counters::SPAWN_LABEL,
+            );
+            // This timer measures how long it took for the task to go from scheduled
+            // to started.
+            let task_start_timer = counters::task_spawn_latency_timer(
+                counters::PEER_BROADCAST_EVENT_LABEL,
+                counters::START_LABEL,
+            );
+
+            bounded_executor
+                .spawn(tasks::process_transaction_broadcast(
+                    smp_clone,
+                    transactions,
+                    request_id,
+                    timeline_state,
+                    peer,
+                    task_start_timer,
+                    rpc_info,
+                ))
+                .await;
+        }
+        MempoolSyncMsg::BroadcastTransactionsResponse {
+            request_id,
+            retry,
+            backoff,
+        } => {
+            if rpc_info.is_some() {
+                warn!(
+                    "Received BroadcastTransactionsResponse as first message in RPC request_id: {:X?}",
+                    request_id
+                );
+                // Don't process this response, as it's potentially malicious
+                return;
+            }
+            let ack_timestamp = SystemTime::now();
+            smp.network_interface.process_broadcast_ack(
+                peer,
+                request_id,
+                retry,
+                backoff,
+                ack_timestamp,
             );
         }
     }

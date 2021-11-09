@@ -14,6 +14,7 @@ use crate::{
     ConsensusRequest, ConsensusResponse, SubmissionStatus,
 };
 use anyhow::Result;
+use bytes::Bytes;
 use diem_config::network_id::PeerNetworkId;
 use diem_crypto::HashValue;
 use diem_infallible::{Mutex, RwLock};
@@ -26,7 +27,7 @@ use diem_types::{
     vm_status::DiscardedVMStatus,
 };
 use futures::{channel::oneshot, stream::FuturesUnordered};
-use network::application::interface::NetworkInterface;
+use network::{application::interface::NetworkInterface, protocols::network::RpcError, ProtocolId};
 use rayon::prelude::*;
 use short_hex_str::AsShortHexStr;
 use std::{
@@ -66,6 +67,7 @@ pub(crate) async fn execute_broadcast<V>(
                 )
                 .peer(&peer)
                 .error(&error)),
+                BroadcastError::InvalidRpcResponse(_, _) => warn!("{:?}", err),
                 _ => {
                     trace!("{:?}", err)
                 }
@@ -152,6 +154,7 @@ pub(crate) async fn process_transaction_broadcast<V>(
     timeline_state: TimelineState,
     peer: PeerNetworkId,
     timer: HistogramTimer,
+    rpc_info: Option<(ProtocolId, oneshot::Sender<Result<Bytes, RpcError>>)>,
 ) where
     V: TransactionValidation,
 {
@@ -165,7 +168,15 @@ pub(crate) async fn process_transaction_broadcast<V>(
 
     let ack_response = gen_ack_response(request_id, results, &peer);
     let network_sender = smp.network_interface.sender();
-    if let Err(e) = network_sender.send_to(peer, ack_response) {
+
+    if let Some((protocol_id, rpc_sender)) = rpc_info {
+        let bytes = protocol_id
+            .to_bytes(&ack_response)
+            .expect("Expected to encode");
+        // Attempt to send the response, letting it go if it doesn't work
+        // TODO: use error responses to provide more accurate responses
+        let _ = rpc_sender.send(Ok(bytes.into()));
+    } else if let Err(e) = network_sender.send_to(peer, ack_response) {
         counters::network_send_fail_inc(counters::ACK_TXNS);
         error!(
             LogSchema::event_log(LogEntry::BroadcastACK, LogEvent::NetworkSendFail)

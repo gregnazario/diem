@@ -145,7 +145,6 @@ pub enum LogEntry {
     CleanRejectedTxn,
     ProcessReadyTxns,
     DBError,
-    UnexpectedNetworkMsg,
     MempoolSnapshot,
 }
 
