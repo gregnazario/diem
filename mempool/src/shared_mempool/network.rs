@@ -94,7 +94,7 @@ pub struct MempoolNetworkSender {
 
 pub fn network_endpoint_config(max_broadcasts_per_peer: usize) -> AppConfig {
     AppConfig::p2p(
-        [ProtocolId::MempoolDirectSend],
+        [ProtocolId::MempoolDirectSend, ProtocolId::MempoolRpc],
         diem_channel::Config::new(max_broadcasts_per_peer)
             .queue_style(QueueStyle::KLAST)
             .counters(&counters::PENDING_MEMPOOL_NETWORK_EVENTS),
@@ -140,6 +140,8 @@ impl ApplicationNetworkSender<MempoolSyncMsg> for MempoolNetworkSender {
 
 #[derive(Debug, Error)]
 pub enum BroadcastError {
+    #[error("Peer {0} received a rpc request instead of a response '{1:x?}'")]
+    InvalidRpcResponse(PeerNetworkId, Vec<u8>),
     #[error("Peer {0} NetworkError: '{1}'")]
     NetworkError(PeerNetworkId, anyhow::Error),
     #[error("Peer {0} has no transactions to broadcast")]
@@ -457,17 +459,60 @@ impl MempoolNetworkInterface {
         peer: PeerNetworkId,
         batch_id: BatchId,
         transactions: Vec<SignedTransaction>,
-    ) -> Result<(), BroadcastError> {
+    ) -> Result<Option<(Vec<u8>, bool, bool)>, BroadcastError> {
+        // Retrieve protocol id to determine send method
+        let protocol_id = if let Some(info) = self.peer_metadata_storage.read(peer) {
+            if info
+                .active_connection
+                .application_protocols
+                .contains(ProtocolId::MempoolRpc)
+            {
+                ProtocolId::MempoolRpc
+            } else {
+                ProtocolId::MempoolDirectSend
+            }
+        } else {
+            // No connection info, no reason to send
+            return Err(BroadcastError::PeerNotFound(peer));
+        };
+
         let request = MempoolSyncMsg::BroadcastTransactionsRequest {
             request_id: bcs::to_bytes(&batch_id).expect("failed BCS serialization of batch ID"),
             transactions,
         };
 
-        if let Err(e) = self.sender.send_to(peer, request) {
-            counters::network_send_fail_inc(counters::BROADCAST_TXNS);
-            return Err(BroadcastError::NetworkError(peer, e.into()));
-        }
-        Ok(())
+        let maybe_rpc_response = match protocol_id {
+            ProtocolId::MempoolDirectSend => {
+                if let Err(e) = self.sender.send_to(peer, request) {
+                    counters::network_send_fail_inc(counters::BROADCAST_TXNS);
+                    return Err(BroadcastError::NetworkError(peer, e.into()));
+                }
+                None
+            }
+            ProtocolId::MempoolRpc => {
+                match self
+                    .sender
+                    .send_rpc(peer, request, Duration::from_secs(2))
+                    .await
+                {
+                    Ok(MempoolSyncMsg::BroadcastTransactionsResponse {
+                        request_id,
+                        retry,
+                        backoff,
+                    }) => Some((request_id, retry, backoff)),
+                    Ok(MempoolSyncMsg::BroadcastTransactionsRequest { request_id, .. }) => {
+                        // We received a request instead of a response
+                        return Err(BroadcastError::InvalidRpcResponse(peer, request_id));
+                    }
+                    Err(e) => {
+                        counters::network_send_fail_inc(counters::BROADCAST_TXNS);
+                        return Err(BroadcastError::NetworkError(peer, e.into()));
+                    }
+                }
+            }
+            _ => unreachable!("ProtocolId is fixed as a Mempool protocol"),
+        };
+        Ok(maybe_rpc_response)
     }
 
     /// Updates the local tracker for a broadcast.  This is used to handle `DirectSend` tracking of
@@ -511,9 +556,14 @@ impl MempoolNetworkInterface {
 
         let num_txns = transactions.len();
         let send_time = SystemTime::now();
-        self.send_batch(peer, batch_id, transactions).await?;
+        let maybe_rpc_response = self.send_batch(peer, batch_id, transactions).await?;
         let num_pending_broadcasts = self.update_broadcast_state(peer, batch_id, send_time)?;
         notify_subscribers(SharedMempoolNotification::Broadcast, &smp.subscribers);
+
+        // If it was RPC, lets process ack
+        if let Some((request_id, retry, backoff)) = maybe_rpc_response {
+            self.process_broadcast_ack(peer, request_id, retry, backoff, SystemTime::now());
+        }
 
         // Log all the metrics
         let latency = start_time.elapsed();

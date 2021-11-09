@@ -7,7 +7,6 @@ use diem_metrics::{
     register_int_gauge_vec, DurationHistogram, HistogramTimer, HistogramVec, IntCounter,
     IntCounterVec, IntGauge, IntGaugeVec,
 };
-use diem_types::PeerId;
 use once_cell::sync::Lazy;
 use short_hex_str::AsShortHexStr;
 use std::time::Duration;
@@ -371,21 +370,6 @@ static NETWORK_SEND_FAIL: Lazy<IntCounterVec> = Lazy::new(|| {
 
 pub fn network_send_fail_inc(label: &'static str) {
     NETWORK_SEND_FAIL.with_label_values(&[label]).inc();
-}
-
-static UNEXPECTED_NETWORK_MSG_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
-    register_int_counter_vec!(
-        "diem_mempool_unexpected_network_count",
-        "Number of unexpected network msgs received",
-        &["network", "peer"]
-    )
-    .unwrap()
-});
-
-pub fn unexpected_msg_count_inc(network_id: &NetworkId, peer_id: &PeerId) {
-    UNEXPECTED_NETWORK_MSG_COUNT
-        .with_label_values(&[network_id.as_str(), peer_id.short_str().as_str()])
-        .inc();
 }
 
 /// Counter for failed callback response to JSON RPC
