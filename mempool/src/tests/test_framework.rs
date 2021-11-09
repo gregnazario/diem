@@ -87,7 +87,7 @@ impl ApplicationNode for MempoolNode {
     }
 
     fn default_protocols(&self) -> &[ProtocolId] {
-        &[ProtocolId::MempoolDirectSend]
+        &[ProtocolId::MempoolDirectSend, ProtocolId::MempoolRpc]
     }
 
     fn get_inbound_handle(&self, network_id: NetworkId) -> InboundNetworkHandle {
