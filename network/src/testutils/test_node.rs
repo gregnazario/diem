@@ -213,7 +213,7 @@ pub trait TestNode: ApplicationNode + Sync {
     /// Connects a node to another node.  The other's inbound handle must already be added.
     fn connect(&self, network_id: NetworkId, metadata: ConnectionMetadata) {
         assert_eq!(ConnectionOrigin::Outbound, metadata.origin);
-        let self_metadata = self.conn_metadata(network_id, ConnectionOrigin::Inbound, None);
+        let self_metadata = self.conn_metadata(network_id, ConnectionOrigin::Inbound, &[]);
         let remote_peer_id = metadata.remote_peer_id;
 
         // Tell the other node it's good to send to the connected peer now
@@ -236,7 +236,7 @@ pub trait TestNode: ApplicationNode + Sync {
 
     /// Disconnects a node from another node
     fn disconnect(&self, network_id: NetworkId, metadata: ConnectionMetadata) {
-        let self_metadata = self.conn_metadata(network_id, ConnectionOrigin::Inbound, None);
+        let self_metadata = self.conn_metadata(network_id, ConnectionOrigin::Inbound, &[]);
         let remote_peer_id = metadata.remote_peer_id;
 
         // Tell the other node it's disconnected
@@ -283,13 +283,17 @@ pub trait TestNode: ApplicationNode + Sync {
         &self,
         network_id: NetworkId,
         origin: ConnectionOrigin,
-        maybe_protocols: Option<&[ProtocolId]>,
+        protocol_ids: &[ProtocolId],
     ) -> ConnectionMetadata {
         mock_conn_metadata(
             self.peer_network_id(network_id),
             self.node_id().peer_role(),
             origin,
-            maybe_protocols.or_else(|| Some(self.default_protocols())),
+            if protocol_ids.is_empty() {
+                self.default_protocols()
+            } else {
+                protocol_ids
+            },
         )
     }
 
@@ -349,19 +353,17 @@ pub trait TestNode: ApplicationNode + Sync {
     }
 }
 
-/// Creates a [`ConnectionMetadata`].  Its [`ProtocolIdSet`] defaults to empty if `maybe_protocols` is `None`
+/// Creates a [`ConnectionMetadata`].
 pub fn mock_conn_metadata(
     peer_network_id: PeerNetworkId,
     peer_role: PeerRole,
     origin: ConnectionOrigin,
-    maybe_protocols: Option<&[ProtocolId]>,
+    protocol_ids: &[ProtocolId],
 ) -> ConnectionMetadata {
     let mut metadata =
         ConnectionMetadata::mock_with_role_and_origin(peer_network_id.peer_id(), peer_role, origin);
-    if let Some(protocol_ids) = maybe_protocols {
-        for protocol_id in protocol_ids {
-            metadata.application_protocols.insert(*protocol_id);
-        }
+    for protocol_id in protocol_ids {
+        metadata.application_protocols.insert(*protocol_id);
     }
     metadata
 }
@@ -372,7 +374,7 @@ pub fn validator_mock_connection(
     protocol_ids: &[ProtocolId],
 ) -> (PeerNetworkId, ConnectionMetadata) {
     let peer = PeerNetworkId::new(NetworkId::Validator, PeerId::random());
-    let metadata = mock_conn_metadata(peer, PeerRole::Validator, origin, Some(protocol_ids));
+    let metadata = mock_conn_metadata(peer, PeerRole::Validator, origin, protocol_ids);
     (peer, metadata)
 }
 
@@ -383,14 +385,11 @@ pub fn vfn_validator_mock_connection(
 ) -> (PeerNetworkId, ConnectionMetadata) {
     let peer = PeerNetworkId::new(NetworkId::Vfn, PeerId::random());
     let metadata = match origin {
-        ConnectionOrigin::Inbound => mock_conn_metadata(
-            peer,
-            PeerRole::ValidatorFullNode,
-            origin,
-            Some(protocol_ids),
-        ),
+        ConnectionOrigin::Inbound => {
+            mock_conn_metadata(peer, PeerRole::ValidatorFullNode, origin, protocol_ids)
+        }
         ConnectionOrigin::Outbound => {
-            mock_conn_metadata(peer, PeerRole::Validator, origin, Some(protocol_ids))
+            mock_conn_metadata(peer, PeerRole::Validator, origin, protocol_ids)
         }
     };
 
@@ -405,14 +404,11 @@ pub fn pfn_vfn_mock_connection(
     let peer = PeerNetworkId::new(NetworkId::Public, PeerId::random());
     let metadata = match origin {
         ConnectionOrigin::Inbound => {
-            mock_conn_metadata(peer, PeerRole::Unknown, origin, Some(protocol_ids))
+            mock_conn_metadata(peer, PeerRole::Unknown, origin, protocol_ids)
         }
-        ConnectionOrigin::Outbound => mock_conn_metadata(
-            peer,
-            PeerRole::ValidatorFullNode,
-            origin,
-            Some(protocol_ids),
-        ),
+        ConnectionOrigin::Outbound => {
+            mock_conn_metadata(peer, PeerRole::ValidatorFullNode, origin, protocol_ids)
+        }
     };
 
     (peer, metadata)
@@ -424,12 +420,7 @@ pub fn vfn_vfn_mock_connection(
     protocol_ids: &[ProtocolId],
 ) -> (PeerNetworkId, ConnectionMetadata) {
     let peer = PeerNetworkId::new(NetworkId::Public, PeerId::random());
-    let metadata = mock_conn_metadata(
-        peer,
-        PeerRole::ValidatorFullNode,
-        origin,
-        Some(protocol_ids),
-    );
+    let metadata = mock_conn_metadata(peer, PeerRole::ValidatorFullNode, origin, protocol_ids);
 
     (peer, metadata)
 }
@@ -440,7 +431,7 @@ pub fn pfn_pfn_mock_connection(
     protocol_ids: &[ProtocolId],
 ) -> (PeerNetworkId, ConnectionMetadata) {
     let peer = PeerNetworkId::new(NetworkId::Public, PeerId::random());
-    let metadata = mock_conn_metadata(peer, PeerRole::Known, origin, Some(protocol_ids));
+    let metadata = mock_conn_metadata(peer, PeerRole::Known, origin, protocol_ids);
 
     (peer, metadata)
 }
