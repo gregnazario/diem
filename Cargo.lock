@@ -2249,6 +2249,7 @@ dependencies = [
  "async-trait",
  "bcs",
  "bounded-executor",
+ "bytes",
  "channel",
  "diem-config",
  "diem-crypto",
