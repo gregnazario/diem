@@ -29,7 +29,7 @@ use futures::{
 use mempool_notifications::{MempoolCommitNotification, MempoolNotificationListener};
 use std::{
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 use tokio::{runtime::Handle, time::interval};
 use tokio_stream::wrappers::IntervalStream;
@@ -319,6 +319,7 @@ async fn handle_message<V>(
             bounded_executor
                 .spawn(tasks::process_transaction_broadcast(
                     smp_clone,
+                    bounded_executor.clone(),
                     transactions,
                     request_id,
                     timeline_state,
@@ -341,13 +342,11 @@ async fn handle_message<V>(
                 // Don't process this response, as it's potentially malicious
                 return;
             }
-            let ack_timestamp = SystemTime::now();
             smp.network_interface.process_broadcast_ack(
                 peer,
                 request_id,
                 retry,
                 backoff,
-                ack_timestamp,
             );
         }
     }

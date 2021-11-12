@@ -1,6 +1,7 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use std::time::Duration;
 use crate::tests::test_framework::{test_transactions, MempoolNode, MempoolTestFrameworkBuilder};
 use diem_config::network_id::PeerNetworkId;
 use netcore::transport::ConnectionOrigin;
@@ -107,6 +108,7 @@ async fn single_inbound_node_test() {
 #[tokio::test]
 async fn single_outbound_node_test() {
     for (mut node, (other_peer_network_id, other_metadata)) in outbound_node_combinations() {
+        println!("Node {} : ({} {})", node, other_peer_network_id, other_metadata);
         let all_txns = test_transactions(0, 2);
         let all_txns = all_txns.as_slice();
 
@@ -120,6 +122,7 @@ async fn single_outbound_node_test() {
             .await;
         node.assert_only_txns_in_mempool(&all_txns[0..1]);
 
+        tokio::time::sleep(Duration::from_millis(50)).await;
         // Adding more txns should also broadcast them upstream
         node.add_txns_via_client(&all_txns[1..2]).await;
         node.verify_broadcast_and_ack(other_peer_network_id, &all_txns[1..2])

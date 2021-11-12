@@ -49,6 +49,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use thiserror::Error;
+use tokio::runtime::Handle;
+use tokio::task::JoinError;
 use vm_validator::vm_validator::TransactionValidation;
 
 /// Container for exchanging transactions with other Mempools.
@@ -154,6 +156,8 @@ pub enum BroadcastError {
     PeerNotScheduled(PeerNetworkId),
     #[error("Peer {0} is over the limit for pending broadcasts")]
     TooManyPendingBroadcasts(PeerNetworkId),
+    #[error("Peer {0} broadcast failed to spawn for RPC: {1}")]
+    SpawnError(PeerNetworkId, JoinError)
 }
 
 type MempoolMultiNetworkSender = MultiNetworkSender<MempoolSyncMsg, MempoolNetworkSender>;
@@ -267,8 +271,8 @@ impl MempoolNetworkInterface {
         request_id_bytes: Vec<u8>,
         retry: bool,
         backoff: bool,
-        timestamp: SystemTime,
     ) {
+        let timestamp = SystemTime::now();
         let batch_id = if let Ok(id) = bcs::from_bytes::<BatchId>(&request_id_bytes) {
             id
         } else {
@@ -306,6 +310,50 @@ impl MempoolNetworkInterface {
             );
             return;
         }
+
+        trace!(
+            LogSchema::new(LogEntry::ReceiveACK)
+                .peer(&peer)
+                .batch_id(&batch_id)
+                .backpressure(backoff),
+            retry = retry,
+        );
+        tasks::update_ack_counter(&peer, counters::RECEIVED_LABEL, retry, backoff);
+
+        if retry {
+            sync_state.broadcast_info.retry_batches.insert(batch_id);
+        }
+
+        // Backoff mode can only be turned off by executing a broadcast that was scheduled
+        // as a backoff broadcast.
+        // This ensures backpressure request from remote peer is honored at least once.
+        if backoff {
+            sync_state.broadcast_info.backoff_mode = true;
+        }
+    }
+
+    pub fn process_rpc_broadcast_ack(
+        &self,
+        peer: PeerNetworkId,
+        request_id_bytes: Vec<u8>,
+        retry: bool,
+        backoff: bool,
+    ) {
+        let batch_id = if let Ok(id) = bcs::from_bytes::<BatchId>(&request_id_bytes) {
+            id
+        } else {
+            counters::invalid_ack_inc(&peer, counters::INVALID_REQUEST_ID);
+            return;
+        };
+
+        let mut sync_states = self.sync_states.write_lock();
+
+        let sync_state = if let Some(state) = sync_states.get_mut(&peer) {
+            state
+        } else {
+            counters::invalid_ack_inc(&peer, counters::UNKNOWN_PEER);
+            return;
+        };
 
         trace!(
             LogSchema::new(LogEntry::ReceiveACK)
@@ -459,7 +507,8 @@ impl MempoolNetworkInterface {
         peer: PeerNetworkId,
         batch_id: BatchId,
         transactions: Vec<SignedTransaction>,
-    ) -> Result<Option<(Vec<u8>, bool, bool)>, BroadcastError> {
+        executor: &Handle,
+    ) -> Result<ProtocolId, BroadcastError> {
         // Retrieve protocol id to determine send method
         let protocol_id = if let Some(info) = self.peer_metadata_storage.read(peer) {
             if info
@@ -481,42 +530,23 @@ impl MempoolNetworkInterface {
             transactions,
         };
 
-        let maybe_rpc_response = match protocol_id {
+        match protocol_id {
             ProtocolId::MempoolDirectSend => {
                 if let Err(e) = self.sender.send_to(peer, request) {
                     counters::network_send_fail_inc(counters::BROADCAST_TXNS);
                     return Err(BroadcastError::NetworkError(peer, e.into()));
                 }
-                None
             }
             ProtocolId::MempoolRpc => {
-                match self
-                    .sender
-                    .send_rpc(
-                        peer,
-                        request,
-                        Duration::from_millis(self.mempool_config.shared_mempool_ack_timeout_ms),
-                    )
-                    .await
-                {
-                    Ok(MempoolSyncMsg::BroadcastTransactionsResponse {
-                        request_id,
-                        retry,
-                        backoff,
-                    }) => Some((request_id, retry, backoff)),
-                    Ok(MempoolSyncMsg::BroadcastTransactionsRequest { request_id, .. }) => {
-                        // We received a request instead of a response
-                        return Err(BroadcastError::InvalidRpcResponse(peer, request_id));
-                    }
-                    Err(e) => {
-                        counters::network_send_fail_inc(counters::BROADCAST_TXNS);
-                        return Err(BroadcastError::NetworkError(peer, e.into()));
-                    }
-                }
+                let timeout =
+                    Duration::from_millis(self.mempool_config.shared_mempool_ack_timeout_ms);
+                executor
+                    .spawn(send_rpc_batch(self.clone(), peer, timeout, request))
+                    .await.map_err(|err| BroadcastError::SpawnError(peer, err))?;
             }
             _ => unreachable!("ProtocolId is fixed as a Mempool protocol"),
         };
-        Ok(maybe_rpc_response)
+        Ok(protocol_id)
     }
 
     /// Updates the local tracker for a broadcast.  This is used to handle `DirectSend` tracking of
@@ -549,6 +579,7 @@ impl MempoolNetworkInterface {
         peer: PeerNetworkId,
         scheduled_backoff: bool,
         smp: &mut SharedMempool<V>,
+        executor: &Handle,
     ) -> Result<(), BroadcastError>
     where
         V: TransactionValidation,
@@ -560,32 +591,34 @@ impl MempoolNetworkInterface {
 
         let num_txns = transactions.len();
         let send_time = SystemTime::now();
-        let maybe_rpc_response = self.send_batch(peer, batch_id, transactions).await?;
+        let protocol_id = self.send_batch(peer, batch_id, transactions, executor).await?;
         let num_pending_broadcasts = self.update_broadcast_state(peer, batch_id, send_time)?;
-        notify_subscribers(SharedMempoolNotification::Broadcast, &smp.subscribers);
 
-        // If it was RPC, lets process ack
-        if let Some((request_id, retry, backoff)) = maybe_rpc_response {
-            self.process_broadcast_ack(peer, request_id, retry, backoff, SystemTime::now());
-        }
-
-        // Log all the metrics
-        let latency = start_time.elapsed();
-        trace!(
-            LogSchema::event_log(LogEntry::BroadcastTransaction, LogEvent::Success)
-                .peer(&peer)
-                .batch_id(&batch_id)
-                .backpressure(scheduled_backoff)
-        );
         let peer_id = peer.peer_id().short_str();
         let network_id = peer.network_id();
+
+        if protocol_id == ProtocolId::MempoolDirectSend {
+            // Log direct send specific metrics
+            let latency = start_time.elapsed();
+            counters::SHARED_MEMPOOL_BROADCAST_LATENCY
+                .with_label_values(&[network_id.as_str(), peer_id.as_str()])
+                .observe(latency.as_secs_f64());
+            counters::shared_mempool_pending_broadcasts(&peer).set(num_pending_broadcasts as i64);
+            trace!(
+                LogSchema::event_log(LogEntry::BroadcastTransaction, LogEvent::Success)
+                    .peer(&peer)
+                    .batch_id(&batch_id)
+                    .backpressure(scheduled_backoff)
+            );
+        }
+
+        notify_subscribers(SharedMempoolNotification::Broadcast, &smp.subscribers);
+
+        // Log all the other metrics
         counters::SHARED_MEMPOOL_TRANSACTION_BROADCAST_SIZE
             .with_label_values(&[network_id.as_str(), peer_id.as_str()])
             .observe(num_txns as f64);
-        counters::shared_mempool_pending_broadcasts(&peer).set(num_pending_broadcasts as i64);
-        counters::SHARED_MEMPOOL_BROADCAST_LATENCY
-            .with_label_values(&[network_id.as_str(), peer_id.as_str()])
-            .observe(latency.as_secs_f64());
+
         if let Some(label) = metric_label {
             counters::SHARED_MEMPOOL_BROADCAST_TYPE_COUNT
                 .with_label_values(&[network_id.as_str(), peer_id.as_str(), label])
@@ -618,6 +651,42 @@ impl NetworkInterface<MempoolSyncMsg, MempoolMultiNetworkSender> for MempoolNetw
 
     fn app_data(&self) -> &LockingHashMap<PeerNetworkId, PeerSyncState> {
         &self.sync_states
+    }
+}
+
+/// A future to handle RPC response - request without blocking the main loop
+async fn send_rpc_batch(
+    network_interface: MempoolNetworkInterface,
+    peer: PeerNetworkId,
+    timeout: Duration,
+    request: MempoolSyncMsg,
+) {
+    let result = match network_interface
+        .sender
+        .send_rpc(peer, request, timeout)
+        .await
+    {
+        Ok(MempoolSyncMsg::BroadcastTransactionsResponse {
+            request_id,
+            retry,
+            backoff,
+        }) => {
+            // Once we have the response, process the ACK
+            network_interface.process_broadcast_ack(peer, request_id, retry, backoff);
+            Ok(())
+        }
+
+        Ok(MempoolSyncMsg::BroadcastTransactionsRequest { request_id, .. }) => {
+            // We received a request instead of a response
+            Err(BroadcastError::InvalidRpcResponse(peer, request_id))        }
+        Err(e) => {
+            counters::network_send_fail_inc(counters::BROADCAST_TXNS);
+            Err(BroadcastError::NetworkError(peer, e.into()))
+        }
+    };
+
+    if let Err(err) = result {
+        debug!("Error sending MempoolRPC broadcast {:?}", err);
     }
 }
 

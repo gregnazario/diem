@@ -37,6 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::runtime::Handle;
+use bounded_executor::BoundedExecutor;
 use vm_validator::vm_validator::{get_account_sequence_number, TransactionValidation};
 
 // ============================== //
@@ -57,7 +58,7 @@ pub(crate) async fn execute_broadcast<V>(
     // If there's no connection, don't bother to broadcast
     if network_interface.app_data().read(&peer).is_some() {
         if let Err(err) = network_interface
-            .execute_broadcast(peer, backoff, smp)
+            .execute_broadcast(peer, backoff, smp, &executor)
             .await
         {
             match err {
@@ -149,6 +150,7 @@ pub(crate) async fn process_client_get_transaction<V>(
 /// Processes transactions from other nodes.
 pub(crate) async fn process_transaction_broadcast<V>(
     smp: SharedMempool<V>,
+    bounded_executor: BoundedExecutor,
     transactions: Vec<SignedTransaction>,
     request_id: Vec<u8>,
     timeline_state: TimelineState,
@@ -175,7 +177,9 @@ pub(crate) async fn process_transaction_broadcast<V>(
             .expect("Expected to encode");
         // Attempt to send the response, letting it go if it doesn't work
         // TODO: use error responses to provide more accurate responses
-        let _ = rpc_sender.send(Ok(bytes.into()));
+        let _ = bounded_executor
+            .spawn(async move { rpc_sender.send(Ok(bytes.into())) })
+            .await;
     } else if let Err(e) = network_sender.send_to(peer, ack_response) {
         counters::network_send_fail_inc(counters::ACK_TXNS);
         error!(
