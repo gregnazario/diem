@@ -453,6 +453,22 @@ impl MempoolNetworkInterface {
         Ok((batch_id, transactions, metric_label))
     }
 
+    pub fn get_protocol(&self, peer: PeerNetworkId) -> Result<ProtocolId, BroadcastError> {
+        if let Some(info) = self.peer_metadata_storage.read(peer) {
+            if info
+                .active_connection
+                .application_protocols
+                .contains(ProtocolId::MempoolRpc)
+            {
+                Ok(ProtocolId::MempoolRpc)
+            } else {
+                Ok(ProtocolId::MempoolDirectSend)
+            }
+        } else {
+            Err(BroadcastError::PeerNotFound(peer))
+        }
+    }
+
     /// Sends a batch to the given `Peer`
     async fn send_batch(
         &self,

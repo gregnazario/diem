@@ -54,29 +54,66 @@ pub(crate) async fn execute_broadcast<V>(
     V: TransactionValidation,
 {
     let network_interface = &smp.network_interface.clone();
-    // If there's no connection, don't bother to broadcast
-    if network_interface.app_data().read(&peer).is_some() {
-        if let Err(err) = network_interface
-            .execute_broadcast(peer, backoff, smp)
-            .await
-        {
-            match err {
-                BroadcastError::NetworkError(peer, error) => error!(LogSchema::event_log(
-                    LogEntry::BroadcastTransaction,
-                    LogEvent::NetworkSendFail
-                )
-                .peer(&peer)
-                .error(&error)),
-                BroadcastError::InvalidRpcResponse(_, _) => warn!("{:?}", err),
-                _ => {
-                    trace!("{:?}", err)
+
+    // Figure out protocol and ensure there's something to broadcast to
+    let protocol = match network_interface.get_protocol(peer) {
+        Ok(protocol) => protocol,
+        Err(_err) => {
+            // Drop the scheduled broadcast, we're not connected anymore
+            return;
+        }
+    };
+
+    match protocol {
+        ProtocolId::MempoolDirectSend => {
+            if let Err(err) = network_interface
+                .execute_broadcast(peer, backoff, smp)
+                .await
+            {
+                match err {
+                    BroadcastError::NetworkError(peer, error) => error!(LogSchema::event_log(
+                        LogEntry::BroadcastTransaction,
+                        LogEvent::NetworkSendFail
+                    )
+                    .peer(&peer)
+                    .error(&error)),
+                    BroadcastError::InvalidRpcResponse(_, _) => warn!("{:?}", err),
+                    _ => {
+                        trace!("{:?}", err)
+                    }
                 }
             }
         }
-    } else {
-        // Drop the scheduled broadcast, we're not connected anymore
-        return;
+        ProtocolId::MempoolRpc => {
+            let network_interface_clone = network_interface.clone();
+            let mut smp_clone = smp.clone();
+            let _ = executor
+                .spawn(async move {
+                    if let Err(err) = network_interface_clone
+                        .execute_broadcast(peer, backoff, &mut smp_clone)
+                        .await
+                    {
+                        match err {
+                            BroadcastError::NetworkError(peer, error) => {
+                                error!(LogSchema::event_log(
+                                    LogEntry::BroadcastTransaction,
+                                    LogEvent::NetworkSendFail
+                                )
+                                .peer(&peer)
+                                .error(&error))
+                            }
+                            BroadcastError::InvalidRpcResponse(_, _) => warn!("{:?}", err),
+                            _ => {
+                                trace!("{:?}", err)
+                            }
+                        }
+                    }
+                })
+                .await;
+        }
+        _ => unreachable!("Mempool should only have mempool protocols"),
     }
+
     let schedule_backoff = network_interface.is_backoff_mode(&peer);
 
     let interval_ms = if schedule_backoff {
