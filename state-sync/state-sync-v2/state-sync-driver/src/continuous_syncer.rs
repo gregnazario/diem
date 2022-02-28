@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    driver::DriverConfiguration,
-    error::Error,
-    notification_handlers::{ConsensusSyncRequest, MempoolNotificationHandler},
-    storage_synchronizer::StorageSynchronizerInterface,
-    utils,
+    driver::DriverConfiguration, error::Error, notification_handlers::ConsensusSyncRequest,
+    storage_synchronizer::StorageSynchronizerInterface, utils, utils::SpeculativeStreamState,
 };
 use data_streaming_service::{
     data_notification::{DataNotification, DataPayload, NotificationId},
@@ -16,52 +13,46 @@ use data_streaming_service::{
 use diem_config::config::ContinuousSyncingMode;
 use diem_infallible::Mutex;
 use diem_types::{
-    contract_event::ContractEvent,
-    epoch_change::Verifier,
     ledger_info::LedgerInfoWithSignatures,
-    transaction::{Transaction, TransactionListWithProof, TransactionOutputListWithProof, Version},
+    transaction::{TransactionListWithProof, TransactionOutputListWithProof, Version},
 };
-use event_notifications::EventSubscriptionService;
-use mempool_notifications::MempoolNotificationSender;
 use std::sync::Arc;
+use storage_interface::DbReader;
 
 /// A simple component that manages the continuous syncing of the node
-pub struct ContinuousSyncer<MempoolNotifier, StorageSyncer> {
+pub struct ContinuousSyncer<StorageSyncer> {
     // The currently active data stream (provided by the data streaming service)
     active_data_stream: Option<DataStreamListener>,
 
     // The config of the state sync driver
     driver_configuration: DriverConfiguration,
 
-    // The event subscription service to notify listeners of on-chain events
-    event_subscription_service: Arc<Mutex<EventSubscriptionService>>,
-
-    // The handler for notifications to mempool
-    mempool_notification_handler: MempoolNotificationHandler<MempoolNotifier>,
+    // The speculative state tracking the active data stream
+    speculative_stream_state: Option<SpeculativeStreamState>,
 
     // The client through which to stream data from the Diem network
     streaming_service_client: StreamingServiceClient,
 
+    // The interface to read from storage
+    storage: Arc<dyn DbReader>,
+
     // The storage synchronizer used to update local storage
-    storage_synchronizer: Arc<Mutex<StorageSyncer>>,
+    storage_synchronizer: StorageSyncer,
 }
 
-impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchronizerInterface>
-    ContinuousSyncer<MempoolNotifier, StorageSyncer>
-{
+impl<StorageSyncer: StorageSynchronizerInterface + Clone> ContinuousSyncer<StorageSyncer> {
     pub fn new(
         driver_configuration: DriverConfiguration,
-        event_subscription_service: Arc<Mutex<EventSubscriptionService>>,
-        mempool_notification_handler: MempoolNotificationHandler<MempoolNotifier>,
         streaming_service_client: StreamingServiceClient,
-        storage_synchronizer: Arc<Mutex<StorageSyncer>>,
+        storage: Arc<dyn DbReader>,
+        storage_synchronizer: StorageSyncer,
     ) -> Self {
         Self {
             active_data_stream: None,
             driver_configuration,
-            event_subscription_service,
-            mempool_notification_handler,
+            speculative_stream_state: None,
             streaming_service_client,
+            storage,
             storage_synchronizer,
         }
     }
@@ -75,6 +66,9 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
             // We have an active data stream. Process any notifications!
             self.process_active_stream_notifications(consensus_sync_request)
                 .await
+        } else if self.storage_synchronizer.pending_transaction_data() {
+            // Wait for any pending transaction data to be processed
+            Ok(())
         } else {
             // Fetch a new data stream to start streaming data
             self.initialize_active_data_stream(consensus_sync_request)
@@ -120,6 +114,11 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
                     .await?
             }
         };
+        self.speculative_stream_state = Some(SpeculativeStreamState::new(
+            utils::fetch_latest_epoch_state(self.storage.clone())?,
+            None,
+            highest_synced_version,
+        ));
         self.active_data_stream = Some(active_data_stream);
 
         Ok(())
@@ -177,9 +176,8 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
 
     /// Returns the highest synced version and epoch in storage
     fn get_highest_synced_version_and_epoch(&self) -> Result<(Version, Version), Error> {
-        let latest_storage_summary = self.storage_synchronizer.lock().get_storage_summary()?;
-        let highest_synced_version = latest_storage_summary.latest_synced_version;
-        let highest_synced_epoch = latest_storage_summary.latest_epoch_state.epoch;
+        let highest_synced_version = utils::fetch_latest_synced_version(self.storage.clone())?;
+        let highest_synced_epoch = utils::fetch_latest_epoch_state(self.storage.clone())?.epoch;
 
         Ok((highest_synced_version, highest_synced_epoch))
     }
@@ -195,7 +193,8 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
         payload_start_version: Option<Version>,
     ) -> Result<(), Error> {
         // Verify the payload starting version
-        self.verify_payload_start_version(notification_id, payload_start_version)
+        let payload_start_version = self
+            .verify_payload_start_version(notification_id, payload_start_version)
             .await?;
 
         // Verify the given proof ledger info
@@ -207,24 +206,20 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
         .await?;
 
         // Execute/apply and commit the transactions/outputs
-        let (committed_events, committed_transactions) =
+        let num_transactions_or_outputs =
             match self.driver_configuration.config.continuous_syncing_mode {
                 ContinuousSyncingMode::ApplyTransactionOutputs => {
                     if let Some(transaction_outputs_with_proof) = transaction_outputs_with_proof {
-                        let committed_transactions = transaction_outputs_with_proof
+                        let num_transaction_outputs = transaction_outputs_with_proof
                             .transactions_and_outputs
-                            .iter()
-                            .map(|(txn, _)| txn.clone())
-                            .collect();
-                        let committed_events = self
-                            .storage_synchronizer
-                            .lock()
-                            .apply_and_commit_transaction_outputs(
-                                transaction_outputs_with_proof,
-                                ledger_info_with_signatures,
-                                None,
-                            );
-                        (committed_events, committed_transactions)
+                            .len();
+                        self.storage_synchronizer.apply_transaction_outputs(
+                            notification_id,
+                            transaction_outputs_with_proof,
+                            ledger_info_with_signatures,
+                            None,
+                        )?;
+                        num_transaction_outputs
                     } else {
                         self.terminate_active_stream(
                             notification_id,
@@ -238,17 +233,14 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
                 }
                 ContinuousSyncingMode::ExecuteTransactions => {
                     if let Some(transaction_list_with_proof) = transaction_list_with_proof {
-                        let committed_transactions =
-                            transaction_list_with_proof.transactions.clone();
-                        let committed_events = self
-                            .storage_synchronizer
-                            .lock()
-                            .execute_and_commit_transactions(
-                                transaction_list_with_proof,
-                                ledger_info_with_signatures,
-                                None,
-                            );
-                        (committed_events, committed_transactions)
+                        let num_transactions = transaction_list_with_proof.transactions.len();
+                        self.storage_synchronizer.execute_transactions(
+                            notification_id,
+                            transaction_list_with_proof,
+                            ledger_info_with_signatures,
+                            None,
+                        )?;
+                        num_transactions
                     } else {
                         self.terminate_active_stream(
                             notification_id,
@@ -261,54 +253,14 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
                     }
                 }
             };
-
-        // Notify listeners of committed events and transactions
-        self.notify_committed_events_and_transactions(
-            notification_id,
-            committed_events,
-            committed_transactions,
-        )
-        .await?;
-
-        // Update the last commit timestamp for the sync request
-        if let Some(sync_request) = consensus_sync_request.lock().as_mut() {
-            sync_request.update_last_commit_timestamp()
-        }
+        let synced_version = payload_start_version
+            .checked_add(num_transactions_or_outputs as u64)
+            .and_then(|version| version.checked_sub(1)) // synced_version = start + num txns/outputs - 1
+            .ok_or_else(|| Error::IntegerOverflow("The synced version has overflown!".into()))?;
+        self.get_speculative_stream_state()
+            .update_synced_version(synced_version);
 
         Ok(())
-    }
-
-    /// Notifies mempool of the committed transactions and notifies the event
-    /// subscription service of committed events.
-    async fn notify_committed_events_and_transactions(
-        &mut self,
-        notification_id: NotificationId,
-        committed_events: Result<Vec<ContractEvent>, Error>,
-        committed_transactions: Vec<Transaction>,
-    ) -> Result<(), Error> {
-        match committed_events {
-            Ok(committed_events) => {
-                let latest_storage_summary =
-                    self.storage_synchronizer.lock().get_storage_summary()?;
-
-                utils::notify_committed_events_and_transactions(
-                    &latest_storage_summary,
-                    self.mempool_notification_handler.clone(),
-                    committed_transactions,
-                    self.event_subscription_service.clone(),
-                    committed_events,
-                )
-                .await
-            }
-            Err(error) => {
-                self.terminate_active_stream(
-                    notification_id,
-                    NotificationFeedback::InvalidPayloadData,
-                )
-                .await?;
-                Err(error)
-            }
-        }
     }
 
     /// Verifies the first payload version matches the version we wish to sync
@@ -316,16 +268,12 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
         &mut self,
         notification_id: NotificationId,
         payload_start_version: Option<Version>,
-    ) -> Result<(), Error> {
-        // Fetch the highest synced version
-        let (highest_synced_version, _) = self.get_highest_synced_version_and_epoch()?;
-
+    ) -> Result<Version, Error> {
         // Compare the payload start version with the expected version
+        let expected_version = self
+            .get_speculative_stream_state()
+            .expected_next_version()?;
         if let Some(payload_start_version) = payload_start_version {
-            let expected_version = highest_synced_version
-                .checked_add(1)
-                .ok_or_else(|| Error::IntegerOverflow("Expected version has overflown!".into()))?;
-
             if payload_start_version != expected_version {
                 self.terminate_active_stream(
                     notification_id,
@@ -337,7 +285,7 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
                     payload_start_version, expected_version
                 )))
             } else {
-                Ok(())
+                Ok(payload_start_version)
             }
         } else {
             self.terminate_active_stream(notification_id, NotificationFeedback::EmptyPayloadData)
@@ -378,15 +326,13 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
         }
 
         // Verify the ledger info state and signatures
-        let latest_storage_summary = self.storage_synchronizer.lock().get_storage_summary()?;
-        let trusted_state = latest_storage_summary.latest_epoch_state;
-        if let Err(error) = trusted_state.verify(ledger_info_with_signatures) {
+        if let Err(error) = self
+            .get_speculative_stream_state()
+            .verify_ledger_info_with_signatures(ledger_info_with_signatures)
+        {
             self.terminate_active_stream(notification_id, NotificationFeedback::PayloadProofFailed)
                 .await?;
-            Err(Error::VerificationError(format!(
-                "Ledger info failed verification: {:?}",
-                error
-            )))
+            Err(error)
         } else {
             Ok(())
         }
@@ -394,11 +340,11 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
 
     /// Handles the end of stream notification or an invalid payload by
     /// terminating the stream appropriately.
-    pub async fn handle_end_of_stream_or_invalid_payload(
+    async fn handle_end_of_stream_or_invalid_payload(
         &mut self,
         data_notification: DataNotification,
     ) -> Result<(), Error> {
-        self.active_data_stream = None;
+        self.reset_active_stream();
 
         utils::handle_end_of_stream_or_invalid_payload(
             &mut self.streaming_service_client,
@@ -408,12 +354,12 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
     }
 
     /// Terminates the currently active stream with the provided feedback
-    async fn terminate_active_stream(
+    pub async fn terminate_active_stream(
         &mut self,
         notification_id: NotificationId,
         notification_feedback: NotificationFeedback,
     ) -> Result<(), Error> {
-        self.active_data_stream = None;
+        self.reset_active_stream();
 
         utils::terminate_stream_with_feedback(
             &mut self.streaming_service_client,
@@ -421,5 +367,18 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
             notification_feedback,
         )
         .await
+    }
+
+    /// Returns the speculative stream state. Assumes that the state exists.
+    fn get_speculative_stream_state(&mut self) -> &mut SpeculativeStreamState {
+        self.speculative_stream_state
+            .as_mut()
+            .expect("Speculative stream state does not exist!")
+    }
+
+    /// Resets the currently active data stream and speculative state
+    fn reset_active_stream(&mut self) {
+        self.speculative_stream_state = None;
+        self.active_data_stream = None;
     }
 }

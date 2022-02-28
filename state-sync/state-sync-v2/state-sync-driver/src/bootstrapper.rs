@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    driver::DriverConfiguration,
-    error::Error,
-    notification_handlers::MempoolNotificationHandler,
-    storage_synchronizer::{StorageStateSummary, StorageSynchronizerInterface},
-    utils,
+    driver::DriverConfiguration, error::Error, storage_synchronizer::StorageSynchronizerInterface,
+    utils, utils::SpeculativeStreamState,
 };
 use data_streaming_service::{
     data_notification::{DataNotification, DataPayload, NotificationId},
@@ -15,20 +12,17 @@ use data_streaming_service::{
 };
 use diem_config::config::BootstrappingMode;
 use diem_data_client::GlobalDataSummary;
-use diem_infallible::Mutex;
 use diem_logger::*;
 use diem_types::{
-    contract_event::ContractEvent,
     epoch_change::Verifier,
     epoch_state::EpochState,
     ledger_info::LedgerInfoWithSignatures,
-    transaction::{Transaction, TransactionListWithProof, TransactionOutputListWithProof, Version},
+    transaction::{TransactionListWithProof, TransactionOutputListWithProof, Version},
     waypoint::Waypoint,
 };
-use event_notifications::EventSubscriptionService;
 use futures::channel::oneshot;
-use mempool_notifications::MempoolNotificationSender;
 use std::{collections::BTreeMap, sync::Arc};
+use storage_interface::DbReader;
 
 /// A simple container for verified epoch states and epoch ending ledger infos
 /// that have been fetched from the network.
@@ -159,7 +153,7 @@ impl VerifiedEpochStates {
         epoch_ending_ledger_info: LedgerInfoWithSignatures,
     ) {
         debug!(
-            "Adding a new epoch to the epoch ending ledger infos: {:?}",
+            "Adding a new epoch to the epoch ending ledger infos: {}",
             &epoch_ending_ledger_info
         );
 
@@ -186,15 +180,8 @@ impl VerifiedEpochStates {
         self.new_epoch_ending_ledger_infos.get(&version).cloned()
     }
 
-    /// Returns the highest known ledger info (including the newly fetch ones)
-    pub fn get_highest_known_ledger_info(
-        &self,
-        latest_storage_summary: StorageStateSummary,
-    ) -> LedgerInfoWithSignatures {
-        // Get the current highest versioned ledger info from storage
-        let mut highest_known_ledger_info = latest_storage_summary.latest_ledger_info;
-
-        // Check if we've fetched a higher versioned ledger info from the network
+    /// Returns the highest known ledger info we've fetched (if any)
+    pub fn get_highest_known_ledger_info(&self) -> Option<LedgerInfoWithSignatures> {
         if !self.new_epoch_ending_ledger_infos.is_empty() {
             let highest_fetched_ledger_info = self
                 .get_epoch_ending_ledger_info(self.highest_fetched_epoch_ending_version)
@@ -204,15 +191,10 @@ impl VerifiedEpochStates {
                         self.highest_fetched_epoch_ending_version
                     )
                 });
-
-            if highest_fetched_ledger_info.ledger_info().version()
-                > highest_known_ledger_info.ledger_info().version()
-            {
-                highest_known_ledger_info = highest_fetched_ledger_info;
-            }
+            Some(highest_fetched_ledger_info)
+        } else {
+            None
         }
-
-        highest_known_ledger_info
     }
 
     /// Returns the next epoch ending version after the given version (if one
@@ -229,7 +211,7 @@ impl VerifiedEpochStates {
 }
 
 /// A simple component that manages the bootstrapping of the node
-pub struct Bootstrapper<MempoolNotifier, StorageSyncer> {
+pub struct Bootstrapper<StorageSyncer> {
     // The currently active data stream (provided by the data streaming service)
     active_data_stream: Option<DataStreamListener>,
 
@@ -242,38 +224,32 @@ pub struct Bootstrapper<MempoolNotifier, StorageSyncer> {
     // The config of the state sync driver
     driver_configuration: DriverConfiguration,
 
-    // The event subscription service to notify listeners of on-chain events
-    event_subscription_service: Arc<Mutex<EventSubscriptionService>>,
-
-    // The handler for notifications to mempool
-    mempool_notification_handler: MempoolNotificationHandler<MempoolNotifier>,
+    // The speculative state tracking the active data stream
+    speculative_stream_state: Option<SpeculativeStreamState>,
 
     // The client through which to stream data from the Diem network
     streaming_service_client: StreamingServiceClient,
 
+    // The interface to read from storage
+    storage: Arc<dyn DbReader>,
+
     // The storage synchronizer used to update local storage
-    storage_synchronizer: Arc<Mutex<StorageSyncer>>,
+    storage_synchronizer: StorageSyncer,
 
     // The epoch states verified by this node (held in memory)
     verified_epoch_states: VerifiedEpochStates,
 }
 
-impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchronizerInterface>
-    Bootstrapper<MempoolNotifier, StorageSyncer>
-{
+impl<StorageSyncer: StorageSynchronizerInterface + Clone> Bootstrapper<StorageSyncer> {
     pub fn new(
         driver_configuration: DriverConfiguration,
-        event_subscription_service: Arc<Mutex<EventSubscriptionService>>,
-        mempool_notification_handler: MempoolNotificationHandler<MempoolNotifier>,
         streaming_service_client: StreamingServiceClient,
-        storage_synchronizer: Arc<Mutex<StorageSyncer>>,
+        storage: Arc<dyn DbReader>,
+        storage_synchronizer: StorageSyncer,
     ) -> Self {
         // Load the latest epoch state from storage
-        let latest_storage_summary = storage_synchronizer
-            .lock()
-            .get_storage_summary()
-            .expect("Unable to load storage summary!");
-        let latest_epoch_state = latest_storage_summary.latest_epoch_state;
+        let latest_epoch_state = utils::fetch_latest_epoch_state(storage.clone())
+            .expect("Unable to fetch latest epoch state!");
         let verified_epoch_states = VerifiedEpochStates::new(latest_epoch_state);
 
         Self {
@@ -281,9 +257,9 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
             bootstrap_notifier_channel: None,
             bootstrapped: false,
             driver_configuration,
-            event_subscription_service,
-            mempool_notification_handler,
+            speculative_stream_state: None,
             streaming_service_client,
+            storage,
             storage_synchronizer,
             verified_epoch_states,
         }
@@ -294,20 +270,28 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
         self.bootstrapped
     }
 
+    /// Marks bootstrapping as complete and notifies any listeners
+    pub fn bootstrapping_complete(&mut self) -> Result<(), Error> {
+        info!("The node has successfully bootstrapped!");
+        self.bootstrapped = true;
+        self.notify_listeners_if_bootstrapped()
+    }
+
     /// Subscribes the specified channel to bootstrap completion notifications
     pub fn subscribe_to_bootstrap_notifications(
         &mut self,
         bootstrap_notifier_channel: oneshot::Sender<Result<(), Error>>,
-    ) {
+    ) -> Result<(), Error> {
         if self.bootstrap_notifier_channel.is_some() {
             panic!("Only one boostrap subscriber is supported at a time!");
         }
 
-        self.bootstrap_notifier_channel = Some(bootstrap_notifier_channel)
+        self.bootstrap_notifier_channel = Some(bootstrap_notifier_channel);
+        self.notify_listeners_if_bootstrapped()
     }
 
     /// Notifies any listeners if we've now bootstrapped
-    fn notify_if_bootstrapped(&mut self) -> Result<(), Error> {
+    fn notify_listeners_if_bootstrapped(&mut self) -> Result<(), Error> {
         if self.bootstrapped {
             if let Some(notifier_channel) = self.bootstrap_notifier_channel.take() {
                 if let Err(error) = notifier_channel.send(Ok(())) {
@@ -336,14 +320,14 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
         if self.active_data_stream.is_some() {
             // We have an active data stream. Process any notifications!
             self.process_active_stream_notifications().await?;
-        } else {
+        } else if !self.storage_synchronizer.pending_transaction_data() {
             // Fetch a new data stream to start streaming data
             self.initialize_active_data_stream(global_data_summary)
                 .await?;
         }
 
         // Check if we've now bootstrapped
-        self.notify_if_bootstrapped()
+        self.notify_listeners_if_bootstrapped()
     }
 
     /// Initializes an active data stream so that we can begin to process notifications
@@ -363,15 +347,13 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
         }
 
         // Get the highest synced and known ledger info versions
-        let highest_synced_version = self.get_highest_synced_version()?;
+        let highest_synced_version = utils::fetch_latest_synced_version(self.storage.clone())?;
         let highest_known_ledger_info = self.get_highest_known_ledger_info()?;
         let highest_known_ledger_version = highest_known_ledger_info.ledger_info().version();
 
         // Check if we've already fetched the required data for bootstrapping
         if highest_synced_version == highest_known_ledger_version {
-            info!("The node has successfully bootstrapped!");
-            self.bootstrapped = true;
-            return Ok(());
+            return self.bootstrapping_complete();
         }
 
         // Verify we haven't synced beyond the highest ledger info
@@ -413,6 +395,11 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
                 unimplemented!("Bootstrapping mode not supported: {:?}", bootstrapping_mode)
             }
         };
+        self.speculative_stream_state = Some(SpeculativeStreamState::new(
+            utils::fetch_latest_epoch_state(self.storage.clone())?,
+            Some(highest_known_ledger_info),
+            highest_synced_version,
+        ));
         self.active_data_stream = Some(data_stream);
 
         Ok(())
@@ -534,10 +521,9 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
         global_data_summary: &GlobalDataSummary,
     ) -> Result<(), Error> {
         // If our storage has already synced beyond our waypoint, nothing needs to be checked
-        let latest_storage_summary = self.storage_synchronizer.lock().get_storage_summary()?;
-        let latest_ledger_info = latest_storage_summary.latest_ledger_info.ledger_info();
+        let latest_ledger_info = utils::fetch_latest_synced_ledger_info(self.storage.clone())?;
         let waypoint_version = self.driver_configuration.waypoint.version();
-        if latest_ledger_info.version() >= waypoint_version {
+        if latest_ledger_info.ledger_info().version() >= waypoint_version {
             self.verified_epoch_states.set_verified_waypoint();
             return Ok(());
         }
@@ -612,8 +598,12 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
         payload_start_version: Option<Version>,
     ) -> Result<(), Error> {
         // Verify the payload starting version
-        self.verify_payload_start_version(notification_id, payload_start_version)
+        let payload_start_version = self
+            .verify_payload_start_version(notification_id, payload_start_version)
             .await?;
+
+        // Get the expected proof ledger info for the payload
+        let proof_ledger_info = self.get_speculative_stream_state().get_proof_ledger_info();
 
         // Get the end of epoch ledger info if the payload ends the epoch
         let end_of_epoch_ledger_info = self
@@ -625,75 +615,65 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
             )
             .await?;
 
-        // Get the highest known ledger info (this should be the proof ledger info)
-        let highest_known_ledger_info = self.get_highest_known_ledger_info()?;
-
         // Execute/apply and commit the transactions/outputs
-        let (committed_events, committed_transactions) =
-            match self.driver_configuration.config.bootstrapping_mode {
-                BootstrappingMode::ApplyTransactionOutputsFromGenesis => {
-                    if let Some(transaction_outputs_with_proof) = transaction_outputs_with_proof {
-                        let committed_transactions = transaction_outputs_with_proof
-                            .transactions_and_outputs
-                            .iter()
-                            .map(|(txn, _)| txn.clone())
-                            .collect();
-                        let committed_events = self
-                            .storage_synchronizer
-                            .lock()
-                            .apply_and_commit_transaction_outputs(
-                                transaction_outputs_with_proof,
-                                highest_known_ledger_info,
-                                end_of_epoch_ledger_info,
-                            );
-                        (committed_events, committed_transactions)
-                    } else {
-                        self.terminate_active_stream(
-                            notification_id,
-                            NotificationFeedback::PayloadTypeIsIncorrect,
-                        )
-                        .await?;
-                        return Err(Error::InvalidPayload(
-                            "Did not receive transaction outputs with proof!".into(),
-                        ));
-                    }
+        let num_transactions_or_outputs = match self.driver_configuration.config.bootstrapping_mode
+        {
+            BootstrappingMode::ApplyTransactionOutputsFromGenesis => {
+                if let Some(transaction_outputs_with_proof) = transaction_outputs_with_proof {
+                    let num_transaction_outputs = transaction_outputs_with_proof
+                        .transactions_and_outputs
+                        .len();
+                    self.storage_synchronizer.apply_transaction_outputs(
+                        notification_id,
+                        transaction_outputs_with_proof,
+                        proof_ledger_info,
+                        end_of_epoch_ledger_info,
+                    )?;
+                    num_transaction_outputs
+                } else {
+                    self.terminate_active_stream(
+                        notification_id,
+                        NotificationFeedback::PayloadTypeIsIncorrect,
+                    )
+                    .await?;
+                    return Err(Error::InvalidPayload(
+                        "Did not receive transaction outputs with proof!".into(),
+                    ));
                 }
-                BootstrappingMode::ExecuteTransactionsFromGenesis => {
-                    if let Some(transaction_list_with_proof) = transaction_list_with_proof {
-                        let committed_transactions =
-                            transaction_list_with_proof.transactions.clone();
-                        let committed_events = self
-                            .storage_synchronizer
-                            .lock()
-                            .execute_and_commit_transactions(
-                                transaction_list_with_proof,
-                                highest_known_ledger_info,
-                                end_of_epoch_ledger_info,
-                            );
-                        (committed_events, committed_transactions)
-                    } else {
-                        self.terminate_active_stream(
-                            notification_id,
-                            NotificationFeedback::PayloadTypeIsIncorrect,
-                        )
-                        .await?;
-                        return Err(Error::InvalidPayload(
-                            "Did not receive transactions with proof!".into(),
-                        ));
-                    }
+            }
+            BootstrappingMode::ExecuteTransactionsFromGenesis => {
+                if let Some(transaction_list_with_proof) = transaction_list_with_proof {
+                    let num_transactions = transaction_list_with_proof.transactions.len();
+                    self.storage_synchronizer.execute_transactions(
+                        notification_id,
+                        transaction_list_with_proof,
+                        proof_ledger_info,
+                        end_of_epoch_ledger_info,
+                    )?;
+                    num_transactions
+                } else {
+                    self.terminate_active_stream(
+                        notification_id,
+                        NotificationFeedback::PayloadTypeIsIncorrect,
+                    )
+                    .await?;
+                    return Err(Error::InvalidPayload(
+                        "Did not receive transactions with proof!".into(),
+                    ));
                 }
-                bootstrapping_mode => {
-                    unimplemented!("Bootstrapping mode not supported: {:?}", bootstrapping_mode)
-                }
-            };
+            }
+            bootstrapping_mode => {
+                unimplemented!("Bootstrapping mode not supported: {:?}", bootstrapping_mode)
+            }
+        };
+        let synced_version = payload_start_version
+            .checked_add(num_transactions_or_outputs as u64)
+            .and_then(|version| version.checked_sub(1)) // synced_version = start + num txns/outputs - 1
+            .ok_or_else(|| Error::IntegerOverflow("The synced version has overflown!".into()))?;
+        self.get_speculative_stream_state()
+            .update_synced_version(synced_version);
 
-        // Notify listeners of committed events and transactions
-        self.notify_committed_events_and_transactions(
-            notification_id,
-            committed_events,
-            committed_transactions,
-        )
-        .await
+        Ok(())
     }
 
     /// Verifies the first payload version matches the version we wish to sync
@@ -701,16 +681,12 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
         &mut self,
         notification_id: NotificationId,
         payload_start_version: Option<Version>,
-    ) -> Result<(), Error> {
-        // Fetch the highest synced version
-        let highest_synced_version = self.get_highest_synced_version()?;
-
+    ) -> Result<Version, Error> {
         // Compare the payload start version with the expected version
+        let expected_version = self
+            .get_speculative_stream_state()
+            .expected_next_version()?;
         if let Some(payload_start_version) = payload_start_version {
-            let expected_version = highest_synced_version
-                .checked_add(1)
-                .ok_or_else(|| Error::IntegerOverflow("Expected version has overflown!".into()))?;
-
             if payload_start_version != expected_version {
                 self.terminate_active_stream(
                     notification_id,
@@ -722,7 +698,7 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
                     payload_start_version, expected_version
                 )))
             } else {
-                Ok(())
+                Ok(payload_start_version)
             }
         } else {
             self.terminate_active_stream(notification_id, NotificationFeedback::EmptyPayloadData)
@@ -739,13 +715,10 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
     async fn get_end_of_epoch_ledger_info(
         &mut self,
         notification_id: NotificationId,
-        payload_start_version: Option<Version>,
+        payload_start_version: Version,
         transaction_list_with_proof: Option<&TransactionListWithProof>,
         transaction_outputs_with_proof: Option<&TransactionOutputListWithProof>,
     ) -> Result<Option<LedgerInfoWithSignatures>, Error> {
-        let payload_start_version =
-            payload_start_version.expect("Payload start version should exist!");
-
         // Calculate the payload end version
         let num_versions = match self.driver_configuration.config.bootstrapping_mode {
             BootstrappingMode::ApplyTransactionOutputsFromGenesis => {
@@ -795,60 +768,33 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
             .get_epoch_ending_ledger_info(payload_end_version))
     }
 
-    /// Notifies mempool of the committed transactions and notifies the event
-    /// subscription service of committed events.
-    async fn notify_committed_events_and_transactions(
-        &mut self,
-        notification_id: NotificationId,
-        committed_events: Result<Vec<ContractEvent>, Error>,
-        committed_transactions: Vec<Transaction>,
-    ) -> Result<(), Error> {
-        match committed_events {
-            Ok(committed_events) => {
-                let latest_storage_summary =
-                    self.storage_synchronizer.lock().get_storage_summary()?;
-
-                utils::notify_committed_events_and_transactions(
-                    &latest_storage_summary,
-                    self.mempool_notification_handler.clone(),
-                    committed_transactions,
-                    self.event_subscription_service.clone(),
-                    committed_events,
-                )
-                .await
-            }
-            Err(error) => {
-                self.terminate_active_stream(
-                    notification_id,
-                    NotificationFeedback::InvalidPayloadData,
-                )
-                .await?;
-                Err(error)
-            }
-        }
-    }
-
-    /// Returns the highest synced version in storage
-    fn get_highest_synced_version(&self) -> Result<Version, Error> {
-        let latest_storage_summary = self.storage_synchronizer.lock().get_storage_summary()?;
-        Ok(latest_storage_summary.latest_synced_version)
-    }
-
     /// Returns the highest known ledger info (including the newly fetch ones)
     fn get_highest_known_ledger_info(&self) -> Result<LedgerInfoWithSignatures, Error> {
-        let latest_storage_summary = self.storage_synchronizer.lock().get_storage_summary()?;
-        Ok(self
-            .verified_epoch_states
-            .get_highest_known_ledger_info(latest_storage_summary))
+        // Fetch the highest synced ledger info from storage
+        let mut highest_known_ledger_info =
+            utils::fetch_latest_synced_ledger_info(self.storage.clone())?;
+
+        // Fetch the highest verified ledger info (from the network) and take
+        // the maximum.
+        if let Some(verified_ledger_info) =
+            self.verified_epoch_states.get_highest_known_ledger_info()
+        {
+            if verified_ledger_info.ledger_info().version()
+                > highest_known_ledger_info.ledger_info().version()
+            {
+                highest_known_ledger_info = verified_ledger_info;
+            }
+        }
+        Ok(highest_known_ledger_info)
     }
 
     /// Handles the end of stream notification or an invalid payload by
     /// terminating the stream appropriately.
-    pub async fn handle_end_of_stream_or_invalid_payload(
+    async fn handle_end_of_stream_or_invalid_payload(
         &mut self,
         data_notification: DataNotification,
     ) -> Result<(), Error> {
-        self.active_data_stream = None;
+        self.reset_active_stream();
 
         utils::handle_end_of_stream_or_invalid_payload(
             &mut self.streaming_service_client,
@@ -858,12 +804,12 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
     }
 
     /// Terminates the currently active stream with the provided feedback
-    async fn terminate_active_stream(
+    pub async fn terminate_active_stream(
         &mut self,
         notification_id: NotificationId,
         notification_feedback: NotificationFeedback,
     ) -> Result<(), Error> {
-        self.active_data_stream = None;
+        self.reset_active_stream();
 
         utils::terminate_stream_with_feedback(
             &mut self.streaming_service_client,
@@ -871,5 +817,18 @@ impl<MempoolNotifier: MempoolNotificationSender, StorageSyncer: StorageSynchroni
             notification_feedback,
         )
         .await
+    }
+
+    /// Returns the speculative stream state. Assumes that the state exists.
+    fn get_speculative_stream_state(&mut self) -> &mut SpeculativeStreamState {
+        self.speculative_stream_state
+            .as_mut()
+            .expect("Speculative stream state does not exist!")
+    }
+
+    /// Resets the currently active data stream and speculative state
+    fn reset_active_stream(&mut self) {
+        self.speculative_stream_state = None;
+        self.active_data_stream = None;
     }
 }

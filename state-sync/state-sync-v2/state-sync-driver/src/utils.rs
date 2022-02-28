@@ -1,26 +1,86 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    error::Error, notification_handlers::MempoolNotificationHandler,
-    storage_synchronizer::StorageStateSummary,
-};
+use crate::error::Error;
 use data_streaming_service::{
     data_notification::{DataNotification, DataPayload, NotificationId},
     data_stream::DataStreamListener,
     streaming_client::{DataStreamingClient, NotificationFeedback, StreamingServiceClient},
 };
-use diem_infallible::Mutex;
 use diem_logger::prelude::*;
-use diem_types::{contract_event::ContractEvent, transaction::Transaction};
-use event_notifications::{EventNotificationSender, EventSubscriptionService};
+use diem_types::{
+    epoch_change::Verifier, epoch_state::EpochState, ledger_info::LedgerInfoWithSignatures,
+    transaction::Version,
+};
 use futures::StreamExt;
-use mempool_notifications::MempoolNotificationSender;
 use std::{sync::Arc, time::Duration};
+use storage_interface::{DbReader, StartupInfo};
 use tokio::time::timeout;
 
 // TODO(joshlind): make this configurable
 const MAX_NOTIFICATION_WAIT_TIME_MS: u64 = 500;
+
+/// The speculative state that tracks a data stream of transactions or outputs.
+/// This assumes all data is valid and allows the driver to speculatively verify
+/// payloads flowing along the stream without having to block on the executor or
+/// storage. Thus, increasing syncing performance.
+pub struct SpeculativeStreamState {
+    epoch_state: EpochState,
+    proof_ledger_info: Option<LedgerInfoWithSignatures>,
+    synced_version: Version,
+}
+
+impl SpeculativeStreamState {
+    pub fn new(
+        epoch_state: EpochState,
+        proof_ledger_info: Option<LedgerInfoWithSignatures>,
+        synced_version: Version,
+    ) -> Self {
+        Self {
+            epoch_state,
+            proof_ledger_info,
+            synced_version,
+        }
+    }
+
+    /// Returns the next version that we expect along the stream
+    pub fn expected_next_version(&self) -> Result<Version, Error> {
+        self.synced_version.checked_add(1).ok_or_else(|| {
+            Error::IntegerOverflow("The expected next version has overflown!".into())
+        })
+    }
+
+    /// Returns the proof ledger info that all data along the stream should have
+    /// proofs relative to. This assumes the proof ledger info exists!
+    pub fn get_proof_ledger_info(&self) -> LedgerInfoWithSignatures {
+        self.proof_ledger_info
+            .as_ref()
+            .expect("Proof ledger info is missing!")
+            .clone()
+    }
+
+    /// Updates the currently synced version of the stream
+    pub fn update_synced_version(&mut self, synced_version: Version) {
+        self.synced_version = synced_version;
+    }
+
+    /// Verifies the given ledger info with signatures against the current epoch
+    /// state and updates the state if the validator set has changed.
+    pub fn verify_ledger_info_with_signatures(
+        &mut self,
+        ledger_info_with_signatures: &LedgerInfoWithSignatures,
+    ) -> Result<(), Error> {
+        self.epoch_state
+            .verify(ledger_info_with_signatures)
+            .map_err(|error| {
+                Error::VerificationError(format!("Ledger info failed verification: {:?}", error))
+            })?;
+        if let Some(epoch_state) = ledger_info_with_signatures.ledger_info().next_epoch_state() {
+            self.epoch_state = epoch_state.clone();
+        }
+        Ok(())
+    }
+}
 
 /// Fetches a data notification from the given data stream listener. Note: this
 /// helper assumes the `active_data_stream` exists and throws an error if a
@@ -84,40 +144,43 @@ pub async fn handle_end_of_stream_or_invalid_payload(
     }
 }
 
-/// Notifies mempool of the committed transactions and notifies the event
-/// subscription service of committed events.
-pub async fn notify_committed_events_and_transactions<M: MempoolNotificationSender>(
-    latest_storage_summary: &StorageStateSummary,
-    mut mempool_notification_handler: MempoolNotificationHandler<M>,
-    committed_transactions: Vec<Transaction>,
-    event_subscription_service: Arc<Mutex<EventSubscriptionService>>,
-    committed_events: Vec<ContractEvent>,
-) -> Result<(), Error> {
-    let latest_synced_version = latest_storage_summary.latest_synced_version;
+/// Fetches the latest epoch state from the specified storage
+pub fn fetch_latest_epoch_state(storage: Arc<dyn DbReader>) -> Result<EpochState, Error> {
+    let startup_info = fetch_startup_info(storage)?;
+    Ok(startup_info.get_epoch_state().clone())
+}
 
-    // Notify mempool of the committed transactions
-    debug!(
-        "Notifying mempool of transactions at version: {:?}",
-        latest_synced_version
-    );
-    let blockchain_timestamp_usecs = latest_storage_summary
-        .latest_ledger_info
-        .ledger_info()
-        .timestamp_usecs();
-    mempool_notification_handler
-        .notify_mempool_of_committed_transactions(
-            committed_transactions.clone(),
-            blockchain_timestamp_usecs,
-        )
-        .await?;
+/// Fetches the latest synced ledger info from the specified storage
+pub fn fetch_latest_synced_ledger_info(
+    storage: Arc<dyn DbReader>,
+) -> Result<LedgerInfoWithSignatures, Error> {
+    let startup_info = fetch_startup_info(storage)?;
+    Ok(startup_info.latest_ledger_info)
+}
 
-    // Notify the event subscription service of the events
-    debug!(
-        "Notifying the event subscription service of events at version: {:?}",
-        latest_synced_version
-    );
-    event_subscription_service
-        .lock()
-        .notify_events(latest_synced_version, committed_events)
-        .map_err(|error| error.into())
+/// Fetches the latest synced version from the specified storage
+pub fn fetch_latest_synced_version(storage: Arc<dyn DbReader>) -> Result<Version, Error> {
+    let latest_transaction_info =
+        storage
+            .get_latest_transaction_info_option()
+            .map_err(|error| {
+                Error::StorageError(format!(
+                    "Failed to get the latest transaction info from storage: {:?}",
+                    error
+                ))
+            })?;
+    latest_transaction_info
+        .ok_or_else(|| Error::StorageError("Latest transaction info is missing!".into()))
+        .map(|(latest_synced_version, _)| latest_synced_version)
+}
+
+/// Fetches the startup info from the specified storage
+fn fetch_startup_info(storage: Arc<dyn DbReader>) -> Result<StartupInfo, Error> {
+    let startup_info = storage.get_startup_info().map_err(|error| {
+        Error::StorageError(format!(
+            "Failed to get startup info from storage: {:?}",
+            error
+        ))
+    })?;
+    startup_info.ok_or_else(|| Error::StorageError("Missing startup info from storage".into()))
 }
