@@ -10,7 +10,6 @@ use diem_types::{
     contract_event::ContractEvent,
     epoch_state::EpochState,
     ledger_info::LedgerInfoWithSignatures,
-    on_chain_config,
     proof::accumulator::InMemoryAccumulator,
     transaction::{Transaction, TransactionInfo, TransactionStatus, TransactionToCommit},
 };
@@ -49,15 +48,18 @@ impl ExecutedChunk {
             .map(|(txn, txn_data)| {
                 Ok(TransactionToCommit::new(
                     txn.clone(),
+                    txn_data.txn_info.clone(),
                     txn_data.account_blobs().clone(),
                     Some(txn_data.jf_node_hashes().clone()),
                     txn_data.write_set().clone(),
                     txn_data.events().to_vec(),
-                    txn_data.gas_used(),
-                    txn_data.status().as_kept_status()?,
                 ))
             })
             .collect()
+    }
+
+    pub fn transactions(&self) -> Vec<Transaction> {
+        self.to_commit.iter().map(|(txn, _)| txn).cloned().collect()
     }
 
     pub fn events_to_commit(&self) -> Vec<ContractEvent> {
@@ -86,7 +88,7 @@ impl ExecutedChunk {
         let txn_info_hashes = self
             .to_commit
             .iter()
-            .map(|(_, txn_data)| txn_data.txn_info_hash().unwrap())
+            .map(|(_, txn_data)| txn_data.txn_info_hash())
             .collect::<Vec<_>>();
         let expected_txn_info_hashes = transaction_infos
             .iter()
@@ -166,21 +168,14 @@ impl ExecutedChunk {
         &self,
         parent_accumulator: &Arc<InMemoryAccumulator<TransactionAccumulatorHasher>>,
     ) -> StateComputeResult {
-        let new_epoch_event_key = on_chain_config::new_epoch_event_key();
         let txn_accu = self.result_view.txn_accumulator();
 
         let mut transaction_info_hashes = Vec::new();
         let mut reconfig_events = Vec::new();
 
         for (_, txn_data) in &self.to_commit {
-            transaction_info_hashes.push(txn_data.txn_info_hash().expect("Txn to be kept."));
-            reconfig_events.extend(
-                txn_data
-                    .events()
-                    .iter()
-                    .filter(|e| *e.key() == new_epoch_event_key)
-                    .cloned(),
-            )
+            transaction_info_hashes.push(txn_data.txn_info_hash());
+            reconfig_events.extend(txn_data.reconfig_events.iter().cloned())
         }
 
         StateComputeResult::new(

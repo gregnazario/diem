@@ -16,7 +16,7 @@ async = ["reqwest", "tokio"]
 faucet = ["reqwest", "reqwest/blocking", "blocking"]
 
 [dependencies]
-anyhow = "1.0.38"
+anyhow = "1.0.52"
 bcs = "0.1.2"
 hex = "0.4.3"
 serde = { version = "1.0.124", features = ["derive"] }
@@ -26,7 +26,7 @@ url = "2.2.2"
 
 diem-crypto = { path = "../diem-crypto", version = "0.0.3" }
 diem-json-rpc-types = { path = "../../json-rpc/types", version = "0.0.3" }
-move-core-types = { path = "../../language/move-core/types", version = "0.0.3" }
+move-core-types = { git = "https://github.com/diem/move", rev = "98ed299a7e3a9223019c9bdf4dd92fea9faef860", version = "0.0.3" }
 diem-types = { path = "../../types", version = "0.0.3" }
 
 # Optional Dependencies
