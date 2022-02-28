@@ -4,6 +4,7 @@
 use crate::{
     block_executor::BlockExecutor,
     chunk_executor::ChunkExecutor,
+    components::{apply_chunk_output::IntoLedgerView, chunk_output::ChunkOutput},
     db_bootstrapper::{generate_waypoint, maybe_bootstrap},
     mock_vm::{
         encode_mint_transaction, encode_reconfiguration_transaction, encode_transfer_transaction,
@@ -11,14 +12,16 @@ use crate::{
     },
 };
 use diem_crypto::HashValue;
+use diem_state_view::StateViewId;
 use diem_types::{
     account_address::AccountAddress,
     block_info::BlockInfo,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    proof::definition::LeafCount,
     transaction::{Transaction, TransactionListWithProof, TransactionStatus, Version},
 };
 use diemdb::DiemDB;
-use executor_types::{BlockExecutorTrait, ChunkExecutorTrait, TransactionReplayer};
+use executor_types::{BlockExecutorTrait, ChunkExecutorTrait, ExecutedTrees, TransactionReplayer};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 use storage_interface::DbReaderWriter;
@@ -313,7 +316,7 @@ fn test_noop_block_after_reconfiguration() {
         .execute_block((first_block_id, vec![first_txn]), parent_block_id)
         .unwrap();
     parent_block_id = first_block_id;
-    let second_block = TestBlock::new(0..10, 10, gen_block_id(2));
+    let second_block = TestBlock::new(10, 10, gen_block_id(2));
     let output2 = executor
         .execute_block((second_block.id, second_block.txns), parent_block_id)
         .unwrap();
@@ -326,48 +329,49 @@ struct TestBlock {
 }
 
 impl TestBlock {
-    fn new(addr_index: std::ops::Range<u64>, amount: u32, id: HashValue) -> Self {
+    fn new(num_user_txns: u64, amount: u32, id: HashValue) -> Self {
         TestBlock {
-            txns: addr_index
+            txns: (0..num_user_txns)
                 .map(|index| encode_mint_transaction(gen_address(index), u64::from(amount)))
                 .collect(),
             id,
         }
     }
+
+    fn len(&self) -> u64 {
+        self.txns.len() as u64
+    }
 }
 
-// Executes a list of transactions by executing and immediately commtting one at a time. Returns
+// Executes a list of transactions by executing and immediately committing one at a time. Returns
 // the root hash after all transactions are committed.
 fn run_transactions_naive(transactions: Vec<Transaction>) -> HashValue {
     let executor = TestExecutor::new();
-    let mut parent_block_id = executor.committed_block_id();
-
-    let mut iter = transactions.into_iter();
-    let first_txn = iter.next().map_or(vec![], |txn| vec![txn]);
-    let first_block_id = gen_block_id(1);
-    let mut root_hash = executor
-        .execute_block((first_block_id, first_txn.clone()), parent_block_id)
+    let db = &executor.db;
+    let mut ledger_view: ExecutedTrees = db
+        .reader
+        .get_latest_tree_state()
         .unwrap()
-        .root_hash();
-    let ledger_info = gen_ledger_info(first_txn.len() as u64, root_hash, first_block_id, 0);
-    executor
-        .commit_blocks(vec![first_block_id], ledger_info)
+        .into_ledger_view(&db.reader)
         .unwrap();
-    parent_block_id = first_block_id;
 
-    for (i, txn) in iter.enumerate() {
-        // when i = 0, id should be 2.
-        let id = gen_block_id(i as u64 + 2);
-        root_hash = executor
-            .execute_block((id, vec![txn.clone()]), parent_block_id)
-            .unwrap()
-            .root_hash();
-
-        let ledger_info = gen_ledger_info(i as u64 + 2, root_hash, id, i as u64 + 1);
-        executor.commit_blocks(vec![id], ledger_info).unwrap();
-        parent_block_id = id;
+    for txn in transactions {
+        let out = ChunkOutput::by_transaction_execution::<MockVM>(
+            vec![txn],
+            ledger_view.state_view(&ledger_view, StateViewId::Miscellaneous, db.reader.clone()),
+        )
+        .unwrap();
+        let (executed, _, _) = out.apply_to_ledger(ledger_view.txn_accumulator()).unwrap();
+        db.writer
+            .save_transactions(
+                &executed.transactions_to_commit().unwrap(),
+                ledger_view.txn_accumulator().num_leaves(),
+                None,
+            )
+            .unwrap();
+        ledger_view = executed.result_view;
     }
-    root_hash
+    ledger_view.txn_accumulator().root_hash()
 }
 
 proptest! {
@@ -383,9 +387,9 @@ proptest! {
         // Genesis -> A -> B
         //            |
         //            └--> C
-        let block_a = TestBlock::new(0..a_size, amount, gen_block_id(1));
-        let block_b = TestBlock::new(0..b_size, amount, gen_block_id(2));
-        let block_c = TestBlock::new(0..c_size, amount, gen_block_id(3));
+        let block_a = TestBlock::new(a_size, amount, gen_block_id(1));
+        let block_b = TestBlock::new(b_size, amount, gen_block_id(2));
+        let block_c = TestBlock::new(c_size, amount, gen_block_id(3));
         // Execute block A, B and C. Hold all results in memory.
         let executor = TestExecutor::new();
         let parent_block_id = executor.committed_block_id();
@@ -394,11 +398,11 @@ proptest! {
             (block_a.id, block_a.txns.clone()), parent_block_id
         ).unwrap();
         let root_hash_a = output_a.root_hash();
-        prop_assert_eq!(output_a.version(), a_size);
+        prop_assert_eq!(output_a.version(), block_a.len());
         let output_b = executor.execute_block((block_b.id, block_b.txns.clone()), block_a.id).unwrap();
-        prop_assert_eq!(output_b.version(), a_size + b_size);
+        prop_assert_eq!(output_b.version(), block_a.len() + block_b.len());
         let output_c = executor.execute_block((block_c.id, block_c.txns.clone()), block_a.id).unwrap();
-        prop_assert_eq!(output_c.version(), a_size + c_size);
+        prop_assert_eq!(output_c.version(), block_a.len() + block_c.len());
 
         let root_hash_b = output_b.root_hash();
         let root_hash_c = output_c.root_hash();
@@ -426,14 +430,15 @@ proptest! {
 
     #[test]
     fn test_reconfiguration_with_retry_transaction_status(
-        (num_txns, reconfig_txn_index) in (10..100u64).prop_flat_map(|num_txns| {
+        (num_user_txns, reconfig_txn_index) in (10..100u64).prop_flat_map(|num_user_txns| {
             (
-                Just(num_txns),
-                0..num_txns
+                Just(num_user_txns),
+                0..num_user_txns
             )
         })) {
             let block_id = gen_block_id(1);
-            let mut block = TestBlock::new(0..num_txns, 10, block_id);
+            let mut block = TestBlock::new(num_user_txns, 10, block_id);
+            let num_txns = block.txns.len() as LeafCount;
             block.txns[reconfig_txn_index as usize] = encode_reconfiguration_transaction(gen_address(reconfig_txn_index));
             let executor = TestExecutor::new();
 
@@ -445,7 +450,10 @@ proptest! {
             // assert: txns after the reconfiguration are with status "Retry"
             let retry_iter = output.compute_status().iter()
             .skip_while(|status| matches!(*status, TransactionStatus::Keep(_)));
-            prop_assert_eq!(retry_iter.take_while(|status| matches!(*status,TransactionStatus::Retry)).count() as u64, num_txns - reconfig_txn_index - 1);
+            prop_assert_eq!(
+                retry_iter.take_while(|status| matches!(*status,TransactionStatus::Retry)).count() as u64,
+                num_txns - reconfig_txn_index - 1
+            );
 
             // commit
             let ledger_info = gen_ledger_info(reconfig_txn_index + 1 /* version */, output.root_hash(), block_id, 1 /* timestamp */);
@@ -460,13 +468,13 @@ proptest! {
             prop_assert!(retry_output.compute_status().iter().all(|s| matches!(*s, TransactionStatus::Keep(_))));
 
             // commit
-            let ledger_info = gen_ledger_info(num_txns  /* version */, retry_output.root_hash(), retry_block_id, 12345 /* timestamp */);
+            let ledger_info = gen_ledger_info(num_txns as Version, retry_output.root_hash(), retry_block_id, 12345 /* timestamp */);
             executor.commit_blocks(vec![retry_block_id], ledger_info).unwrap();
 
             // get txn_infos from db
             let db = executor.db.reader.clone();
             prop_assert_eq!(db.get_latest_version().unwrap(), num_txns as Version);
-            let txn_list = db.get_transactions(1 /* start version */, num_txns, num_txns as Version /* ledger version */, false /* fetch events */).unwrap();
+            let txn_list = db.get_transactions(1 /* start version */, num_txns as u64, num_txns as Version /* ledger version */, false /* fetch events */).unwrap();
             prop_assert_eq!(&block.txns, &txn_list.transactions);
             let txn_infos = txn_list.proof.transaction_infos;
 
@@ -476,13 +484,16 @@ proptest! {
             replayer.executor.replay(block.txns, txn_infos).unwrap();
             replayer.executor.commit().unwrap();
             let replayed_db = replayer.db.reader.clone();
-            prop_assert_eq!(replayed_db.get_latest_state_root().unwrap(), db.get_latest_state_root().unwrap())
+            prop_assert_eq!(
+                replayed_db.get_accumulator_root_hash(num_txns).unwrap(),
+                db.get_accumulator_root_hash(num_txns).unwrap()
+            );
         }
 
     #[test]
     fn test_executor_restart(a_size in 1..30u64, b_size in 1..30u64, amount in any::<u32>()) {
-        let block_a = TestBlock::new(0..a_size, amount, gen_block_id(1));
-        let block_b = TestBlock::new(0..b_size, amount, gen_block_id(2));
+        let block_a = TestBlock::new(a_size, amount, gen_block_id(1));
+        let block_b = TestBlock::new(b_size, amount, gen_block_id(2));
 
         let TestExecutor { _path, db, executor } = TestExecutor::new();
         let mut parent_block_id;

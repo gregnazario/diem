@@ -14,7 +14,7 @@ default = ["dpn"]
 dpn = []
 
 [dependencies]
-anyhow = "1.0.38"
+anyhow = "1.0.52"
 bcs = "0.1.2"
 hex = "0.4.3"
 reqwest = { version = "0.11.2", features = ["json"] }
@@ -29,4 +29,4 @@ diem-crypto = { path = "../diem-crypto" }
 diem-json-rpc-types = { path = "../../json-rpc/types" }
 diem-types = { path = "../../types" }
 diem-workspace-hack = { version = "0.1", path = "../diem-workspace-hack" }
-move-core-types = { path = "../../language/move-core/types" }
+move-core-types = { git = "https://github.com/diem/move", rev = "98ed299a7e3a9223019c9bdf4dd92fea9faef860" }

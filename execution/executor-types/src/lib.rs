@@ -35,7 +35,7 @@ use diem_types::{
 use scratchpad::ProofRead;
 use serde::{Deserialize, Serialize};
 use std::{cmp::max, collections::HashMap, sync::Arc};
-use storage_interface::{DbReader, TreeState};
+use storage_interface::DbReader;
 
 pub use executed_chunk::ExecutedChunk;
 use storage_interface::state_view::VerifiedStateView;
@@ -64,22 +64,23 @@ pub trait ChunkExecutorTrait: Send + Sync {
         epoch_change_li: Option<&LedgerInfoWithSignatures>,
     ) -> anyhow::Result<()>;
 
-    /// Commit a previously executed chunks, returns a vector of reconfiguration events in the chunk.
-    fn commit_chunk(&self) -> Result<Vec<ContractEvent>>;
+    /// Commit a previously executed chunk. Returns a vector of reconfiguration
+    /// events in the chunk and the transactions that were committed.
+    fn commit_chunk(&self) -> Result<(Vec<ContractEvent>, Vec<Transaction>)>;
 
     fn execute_and_commit_chunk(
         &self,
         txn_list_with_proof: TransactionListWithProof,
         verified_target_li: &LedgerInfoWithSignatures,
         epoch_change_li: Option<&LedgerInfoWithSignatures>,
-    ) -> Result<Vec<ContractEvent>>;
+    ) -> Result<(Vec<ContractEvent>, Vec<Transaction>)>;
 
     fn apply_and_commit_chunk(
         &self,
         txn_output_list_with_proof: TransactionOutputListWithProof,
         verified_target_li: &LedgerInfoWithSignatures,
         epoch_change_li: Option<&LedgerInfoWithSignatures>,
-    ) -> Result<Vec<ContractEvent>>;
+    ) -> Result<(Vec<ContractEvent>, Vec<Transaction>)>;
 }
 
 pub trait BlockExecutorTrait: Send + Sync {
@@ -296,16 +297,6 @@ pub struct ExecutedTrees {
     transaction_accumulator: Arc<InMemoryAccumulator<TransactionAccumulatorHasher>>,
 }
 
-impl From<TreeState> for ExecutedTrees {
-    fn from(tree_state: TreeState) -> Self {
-        ExecutedTrees::new(
-            tree_state.account_state_root_hash,
-            tree_state.ledger_frozen_subtree_hashes,
-            tree_state.num_transactions,
-        )
-    }
-}
-
 impl ExecutedTrees {
     pub fn new_copy(
         state_tree: SparseMerkleTree,
@@ -390,6 +381,10 @@ impl ProofReader {
     pub fn new(account_to_proof: HashMap<HashValue, SparseMerkleProof>) -> Self {
         ProofReader { account_to_proof }
     }
+
+    pub fn new_empty() -> Self {
+        Self::new(HashMap::new())
+    }
 }
 
 impl ProofRead<AccountStateBlob> for ProofReader {
@@ -418,11 +413,11 @@ pub struct TransactionData {
     /// The list of events emitted during this transaction.
     events: Vec<ContractEvent>,
 
+    /// List of reconfiguration events emitted during this transaction.
+    reconfig_events: Vec<ContractEvent>,
+
     /// The execution status set by the VM.
     status: TransactionStatus,
-
-    /// Root hash of the state tree.
-    state_root_hash: HashValue,
 
     /// The in-memory Merkle Accumulator that has all events emitted by this transaction.
     event_tree: Arc<InMemoryAccumulator<EventAccumulatorHasher>>,
@@ -430,8 +425,11 @@ pub struct TransactionData {
     /// The amount of gas used.
     gas_used: u64,
 
-    /// The transaction info hash if the VM status output was keep, None otherwise
-    txn_info_hash: Option<HashValue>,
+    /// TransactionInfo
+    txn_info: TransactionInfo,
+
+    /// TransactionInfo.hash()
+    txn_info_hash: HashValue,
 }
 
 impl TransactionData {
@@ -440,21 +438,23 @@ impl TransactionData {
         jf_node_hashes: HashMap<NibblePath, HashValue>,
         write_set: WriteSet,
         events: Vec<ContractEvent>,
+        reconfig_events: Vec<ContractEvent>,
         status: TransactionStatus,
-        state_root_hash: HashValue,
         event_tree: Arc<InMemoryAccumulator<EventAccumulatorHasher>>,
         gas_used: u64,
-        txn_info_hash: Option<HashValue>,
+        txn_info: TransactionInfo,
+        txn_info_hash: HashValue,
     ) -> Self {
         TransactionData {
             account_blobs,
             jf_node_hashes,
             write_set,
             events,
+            reconfig_events,
             status,
-            state_root_hash,
             event_tree,
             gas_used,
+            txn_info,
             txn_info_hash,
         }
     }
@@ -479,10 +479,6 @@ impl TransactionData {
         &self.status
     }
 
-    pub fn state_root_hash(&self) -> HashValue {
-        self.state_root_hash
-    }
-
     pub fn event_root_hash(&self) -> HashValue {
         self.event_tree.root_hash()
     }
@@ -491,7 +487,7 @@ impl TransactionData {
         self.gas_used
     }
 
-    pub fn txn_info_hash(&self) -> Option<HashValue> {
+    pub fn txn_info_hash(&self) -> HashValue {
         self.txn_info_hash
     }
 }

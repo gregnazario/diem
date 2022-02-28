@@ -1,53 +1,61 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::Error;
-use diem_infallible::RwLock;
+use crate::{
+    error::Error,
+    notification_handlers::{CommitNotification, ErrorNotification},
+};
+use data_streaming_service::data_notification::NotificationId;
+use diem_logger::prelude::*;
 use diem_types::{
     account_state_blob::AccountStatesChunkWithProof,
-    contract_event::ContractEvent,
-    epoch_state::EpochState,
     ledger_info::LedgerInfoWithSignatures,
-    transaction::{TransactionListWithProof, TransactionOutputListWithProof, Version},
+    transaction::{TransactionListWithProof, TransactionOutputListWithProof},
 };
-use executor_types::{ChunkExecutorTrait, ExecutedTrees};
-use std::sync::Arc;
-use storage_interface::DbReaderWriter;
+use executor_types::ChunkExecutorTrait;
+use futures::{channel::mpsc, SinkExt, StreamExt};
+use std::{
+    future::Future,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
+use tokio::runtime::Runtime;
 
-/// A summary of the state of local storage at a specific snapshot (e.g., version)
-#[derive(Clone, Debug)]
-pub struct StorageStateSummary {
-    pub latest_epoch_state: EpochState,
-    pub latest_executed_trees: ExecutedTrees,
-    pub latest_ledger_info: LedgerInfoWithSignatures,
-    pub latest_synced_version: Version,
-}
+// TODO(joshlind): add structured logging support!
+
+// The maximum number of chunks that are pending execution or commit
+const MAX_PENDING_CHUNKS: usize = 50;
 
 /// Synchronizes the storage of the node by verifying and storing new data
 /// (e.g., transactions and outputs).
 pub trait StorageSynchronizerInterface {
-    /// Applies and commits a batch of transaction outputs to storage.
+    /// Applies a batch of transaction outputs.
     ///
     /// Note: this assumes that the ledger infos have already been verified.
-    fn apply_and_commit_transaction_outputs(
+    fn apply_transaction_outputs(
         &mut self,
+        notification_id: NotificationId,
         output_list_with_proof: TransactionOutputListWithProof,
         target_ledger_info: LedgerInfoWithSignatures,
         end_of_epoch_ledger_info: Option<LedgerInfoWithSignatures>,
-    ) -> Result<Vec<ContractEvent>, Error>;
+    ) -> Result<(), Error>;
 
-    /// Executes and commits a batch of transactions to storage.
+    /// Executes a batch of transactions.
     ///
     /// Note: this assumes that the ledger infos have already been verified.
-    fn execute_and_commit_transactions(
+    fn execute_transactions(
         &mut self,
+        notification_id: NotificationId,
         transaction_list_with_proof: TransactionListWithProof,
         target_ledger_info: LedgerInfoWithSignatures,
         end_of_epoch_ledger_info: Option<LedgerInfoWithSignatures>,
-    ) -> Result<Vec<ContractEvent>, Error>;
+    ) -> Result<(), Error>;
 
-    /// Returns the latest storage summary
-    fn get_storage_summary(&mut self) -> Result<StorageStateSummary, Error>;
+    /// Returns true iff there is transaction data that is still waiting
+    /// to be executed/applied or committed.
+    fn pending_transaction_data(&self) -> bool;
 
     /// Saves the given account states to storage
     fn save_account_states(
@@ -57,117 +65,109 @@ pub trait StorageSynchronizerInterface {
 }
 
 /// The implementation of the `StorageSynchronizerInterface` used by state sync
+#[derive(Clone)]
 pub struct StorageSynchronizer {
-    chunk_executor: Box<dyn ChunkExecutorTrait>,
-    storage: Arc<RwLock<DbReaderWriter>>,
+    // A channel through which to notify the executor of new transaction data chunks
+    executor_notifier: mpsc::Sender<TransactionDataChunk>,
+
+    // The number of transaction data chunks pending execute/apply, or commit
+    pending_transaction_chunks: Arc<AtomicU64>,
 }
 
 impl StorageSynchronizer {
-    pub fn new(
-        chunk_executor: Box<dyn ChunkExecutorTrait>,
-        storage: Arc<RwLock<DbReaderWriter>>,
+    pub fn new<ChunkExecutor: ChunkExecutorTrait + 'static>(
+        chunk_executor: Arc<ChunkExecutor>,
+        commit_notification_sender: mpsc::UnboundedSender<CommitNotification>,
+        error_notification_sender: mpsc::UnboundedSender<ErrorNotification>,
+        runtime: Option<&Runtime>,
     ) -> Self {
-        Self {
+        // Create a channel to notify the executor when transaction data chunks are ready
+        let (executor_notifier, executor_listener) = mpsc::channel(MAX_PENDING_CHUNKS);
+
+        // Create a channel to notify the committer when executed chunks are ready
+        let (committer_notifier, committer_listener) = mpsc::channel(MAX_PENDING_CHUNKS);
+
+        // Create a shared pending transaction chunk counter
+        let pending_transaction_chunks = Arc::new(AtomicU64::new(0));
+
+        // Spawn the executor that executes/applies transaction data chunks
+        spawn_executor(
+            chunk_executor.clone(),
+            error_notification_sender.clone(),
+            executor_listener,
+            committer_notifier,
+            pending_transaction_chunks.clone(),
+            runtime,
+        );
+
+        // Spawn the committer that commits executed (but pending) chunks
+        spawn_committer(
             chunk_executor,
-            storage,
+            committer_listener,
+            commit_notification_sender,
+            error_notification_sender,
+            pending_transaction_chunks.clone(),
+            runtime,
+        );
+
+        Self {
+            executor_notifier,
+            pending_transaction_chunks,
         }
     }
 
-    fn fetch_storage_summary(&mut self) -> Result<StorageStateSummary, Error> {
-        // Fetch the startup info from storage
-        let startup_info = self
-            .storage
-            .read()
-            .reader
-            .get_startup_info()
-            .map_err(|error| {
-                Error::StorageError(format!(
-                    "Failed to get startup info from storage: {:?}",
-                    error
-                ))
-            })?;
-        let storage_info = startup_info
-            .ok_or_else(|| Error::StorageError("Missing startup info from storage".into()))?;
-
-        // Grab the latest epoch state, executed trees and ledger info
-        let latest_epoch_state = storage_info.get_epoch_state().clone();
-        let latest_executed_trees = if let Some(synced_tree_state) = storage_info.synced_tree_state
-        {
-            ExecutedTrees::from(synced_tree_state)
+    /// Notifies the executor of new transaction data chunks
+    fn notify_executor(
+        &mut self,
+        transaction_data_chunk: TransactionDataChunk,
+    ) -> Result<(), Error> {
+        if let Err(error) = self.executor_notifier.try_send(transaction_data_chunk) {
+            Err(Error::UnexpectedError(format!(
+                "Failed to send transaction data chunk to executor: {:?}",
+                error
+            )))
         } else {
-            ExecutedTrees::from(storage_info.committed_tree_state)
-        };
-        let latest_ledger_info = storage_info.latest_ledger_info;
-
-        // Fetch the latest synced version
-        let latest_transaction_info = self
-            .storage
-            .read()
-            .reader
-            .get_latest_transaction_info_option()
-            .map_err(|error| {
-                Error::StorageError(format!(
-                    "Failed to get the latest transaction info from storage: {:?}",
-                    error
-                ))
-            })?;
-        let (latest_synced_version, _) = latest_transaction_info
-            .ok_or_else(|| Error::StorageError("Latest transaction info is missing!".into()))?;
-
-        // Create the storage summary
-        let storage_state_summary = StorageStateSummary {
-            latest_epoch_state,
-            latest_executed_trees,
-            latest_ledger_info,
-            latest_synced_version,
-        };
-        Ok(storage_state_summary)
+            increment_atomic(self.pending_transaction_chunks.clone());
+            Ok(())
+        }
     }
 }
 
 impl StorageSynchronizerInterface for StorageSynchronizer {
-    fn apply_and_commit_transaction_outputs(
+    fn apply_transaction_outputs(
         &mut self,
+        notification_id: NotificationId,
         output_list_with_proof: TransactionOutputListWithProof,
         target_ledger_info: LedgerInfoWithSignatures,
         end_of_epoch_ledger_info: Option<LedgerInfoWithSignatures>,
-    ) -> Result<Vec<ContractEvent>, Error> {
-        let committed_events = self
-            .chunk_executor
-            .apply_and_commit_chunk(
-                output_list_with_proof,
-                &target_ledger_info,
-                end_of_epoch_ledger_info.as_ref(),
-            )
-            .map_err(|error| {
-                Error::UnexpectedError(format!("Apply and commit chunk failed: {}", error))
-            })?;
-
-        Ok(committed_events)
+    ) -> Result<(), Error> {
+        let transaction_data_chunk = TransactionDataChunk::TransactionOutputs(
+            notification_id,
+            output_list_with_proof,
+            target_ledger_info,
+            end_of_epoch_ledger_info,
+        );
+        self.notify_executor(transaction_data_chunk)
     }
 
-    fn execute_and_commit_transactions(
+    fn execute_transactions(
         &mut self,
+        notification_id: NotificationId,
         transaction_list_with_proof: TransactionListWithProof,
         target_ledger_info: LedgerInfoWithSignatures,
         end_of_epoch_ledger_info: Option<LedgerInfoWithSignatures>,
-    ) -> Result<Vec<ContractEvent>, Error> {
-        let committed_events = self
-            .chunk_executor
-            .execute_and_commit_chunk(
-                transaction_list_with_proof,
-                &target_ledger_info,
-                end_of_epoch_ledger_info.as_ref(),
-            )
-            .map_err(|error| {
-                Error::UnexpectedError(format!("Execute and commit chunk failed: {}", error))
-            })?;
-
-        Ok(committed_events)
+    ) -> Result<(), Error> {
+        let transaction_data_chunk = TransactionDataChunk::Transactions(
+            notification_id,
+            transaction_list_with_proof,
+            target_ledger_info,
+            end_of_epoch_ledger_info,
+        );
+        self.notify_executor(transaction_data_chunk)
     }
 
-    fn get_storage_summary(&mut self) -> Result<StorageStateSummary, Error> {
-        self.fetch_storage_summary()
+    fn pending_transaction_data(&self) -> bool {
+        self.pending_transaction_chunks.load(Ordering::Relaxed) > 0
     }
 
     fn save_account_states(
@@ -175,5 +175,159 @@ impl StorageSynchronizerInterface for StorageSynchronizer {
         _account_states_with_proof: AccountStatesChunkWithProof,
     ) -> Result<(), Error> {
         unimplemented!("Saving account states to storage is not currently supported!")
+    }
+}
+
+/// A chunk of data (i.e., transactions or transaction outputs) to be executed
+/// and committed.
+enum TransactionDataChunk {
+    Transactions(
+        NotificationId,
+        TransactionListWithProof,
+        LedgerInfoWithSignatures,
+        Option<LedgerInfoWithSignatures>,
+    ),
+    TransactionOutputs(
+        NotificationId,
+        TransactionOutputListWithProof,
+        LedgerInfoWithSignatures,
+        Option<LedgerInfoWithSignatures>,
+    ),
+}
+
+/// Spawns a dedicated executor that executes/applies transaction data chunks
+fn spawn_executor<ChunkExecutor: ChunkExecutorTrait + 'static>(
+    chunk_executor: Arc<ChunkExecutor>,
+    error_notification_sender: mpsc::UnboundedSender<ErrorNotification>,
+    mut executor_listener: mpsc::Receiver<TransactionDataChunk>,
+    mut committer_notifier: mpsc::Sender<NotificationId>,
+    pending_transaction_chunks: Arc<AtomicU64>,
+    runtime: Option<&Runtime>,
+) {
+    // Create an executor
+    let executor = async move {
+        loop {
+            ::futures::select! {
+                transaction_data_chunk = executor_listener.select_next_some() => {
+                    // Execute/apply the transaction data chunk
+                    let (notification_id, result) = match transaction_data_chunk {
+                        TransactionDataChunk::Transactions(notification_id, transactions_with_proof, target_ledger_info, end_of_epoch_ledger_info) => {
+                            let result = chunk_executor
+                               .execute_chunk(
+                                    transactions_with_proof,
+                                    &target_ledger_info,
+                                    end_of_epoch_ledger_info.as_ref(),
+                                );
+                            (notification_id, result)
+                        },
+                        TransactionDataChunk::TransactionOutputs(notification_id, outputs_with_proof, target_ledger_info, end_of_epoch_ledger_info) => {
+                            let result = chunk_executor
+                                .apply_chunk(
+                                    outputs_with_proof,
+                                    &target_ledger_info,
+                                    end_of_epoch_ledger_info.as_ref(),
+                                );
+                             (notification_id, result)
+                        }
+                    };
+
+                    // Notify the committer of new executed chunks
+                    match result {
+                        Ok(()) => {
+                            if let Err(error) = committer_notifier.try_send(notification_id) {
+                                let error = format!("Failed to notify the committer! Error: {:?}", error);
+                                send_storage_synchronizer_error(error_notification_sender.clone(), notification_id, error).await;
+                                decrement_atomic(pending_transaction_chunks.clone());
+                            }
+                        },
+                        Err(error) => {
+                            let error = format!("Failed to execute/apply the transaction data chunk! Error: {:?}", error);
+                            send_storage_synchronizer_error(error_notification_sender.clone(), notification_id, error).await;
+                            decrement_atomic(pending_transaction_chunks.clone());
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // Spawn the executor
+    spawn(runtime, executor);
+}
+
+/// Spawns a dedicated committer that commits executed (but pending) chunks
+fn spawn_committer<ChunkExecutor: ChunkExecutorTrait + 'static>(
+    chunk_executor: Arc<ChunkExecutor>,
+    mut committer_listener: mpsc::Receiver<NotificationId>,
+    mut commit_notification_sender: mpsc::UnboundedSender<CommitNotification>,
+    error_notification_sender: mpsc::UnboundedSender<ErrorNotification>,
+    pending_transaction_chunks: Arc<AtomicU64>,
+    runtime: Option<&Runtime>,
+) {
+    // Create an executor
+    let committer = async move {
+        loop {
+            ::futures::select! {
+                notification_id = committer_listener.select_next_some() => {
+                    // Commit the executed chunk
+                    match chunk_executor.commit_chunk() {
+                        Ok((events, transactions)) => {
+                            let commit_notification = CommitNotification::new(events, transactions);
+                            if let Err(error) = commit_notification_sender.send(commit_notification).await {
+                                let error = format!("Failed to send commit notification! Error: {:?}", error);
+                                send_storage_synchronizer_error(error_notification_sender.clone(), notification_id, error).await;
+                            }
+                        }
+                        Err(error) => {
+                            let error = format!("Failed to commit executed chunk! Error: {:?}", error);
+                            send_storage_synchronizer_error(error_notification_sender.clone(), notification_id, error).await;
+                        }
+                    };
+                    decrement_atomic(pending_transaction_chunks.clone());
+                }
+            }
+        }
+    };
+
+    // Spawn the committer
+    spawn(runtime, committer);
+}
+
+/// Spawns a future on a specified runtime. If no runtime is specified, uses
+/// the current runtime.
+fn spawn(runtime: Option<&Runtime>, future: impl Future<Output = ()> + Send + 'static) {
+    if let Some(runtime) = runtime {
+        runtime.spawn(future);
+    } else {
+        tokio::spawn(future);
+    }
+}
+
+/// Increments the given atomic u64
+fn increment_atomic(atomic_u64: Arc<AtomicU64>) {
+    atomic_u64.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Decrements the given atomic u64
+fn decrement_atomic(atomic_u64: Arc<AtomicU64>) {
+    atomic_u64.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Sends an error notification to the notification listener
+async fn send_storage_synchronizer_error(
+    mut error_notification_sender: mpsc::UnboundedSender<ErrorNotification>,
+    notification_id: NotificationId,
+    error_message: String,
+) {
+    let error_message = format!("Storage synchronizer error: {:?}", error_message);
+    error!("{:?}", error_message);
+
+    // Send an error notification
+    let error_notification = ErrorNotification {
+        error: Error::UnexpectedError(error_message),
+        notification_id,
+    };
+    if let Err(error) = error_notification_sender.send(error_notification).await {
+        panic!("Failed to send error notification! Error: {:?}", error);
     }
 }

@@ -5,7 +5,8 @@ use crate::{
     access_path::AccessPath,
     account_address::{self, AccountAddress},
     account_config::{
-        AccountResource, BalanceResource, KeyRotationCapabilityResource, WithdrawCapabilityResource,
+        AccountResource, BalanceResource, DiemAccountResource, KeyRotationCapabilityResource,
+        WithdrawCapabilityResource,
     },
     account_state_blob::AccountStateBlob,
     block_info::{BlockInfo, Round},
@@ -19,8 +20,9 @@ use crate::{
     proof::TransactionInfoListWithProof,
     transaction::{
         ChangeSet, Module, ModuleBundle, RawTransaction, Script, SignatureCheckedTransaction,
-        SignedTransaction, Transaction, TransactionArgument, TransactionListWithProof,
-        TransactionPayload, TransactionStatus, TransactionToCommit, Version, WriteSetPayload,
+        SignedTransaction, Transaction, TransactionArgument, TransactionInfo,
+        TransactionListWithProof, TransactionPayload, TransactionStatus, TransactionToCommit,
+        Version, WriteSetPayload,
     },
     validator_info::ValidatorInfo,
     validator_signer::ValidatorSigner,
@@ -664,10 +666,32 @@ impl ContractEventGen {
 }
 
 #[derive(Arbitrary, Debug)]
-pub struct AccountResourceGen {
+pub struct DiemAccountResourceGen {
     withdrawal_capability: Option<WithdrawCapabilityResource>,
     key_rotation_capability: Option<KeyRotationCapabilityResource>,
 }
+
+impl DiemAccountResourceGen {
+    pub fn materialize(
+        self,
+        account_index: Index,
+        universe: &AccountInfoUniverse,
+    ) -> DiemAccountResource {
+        let account_info = universe.get_account_info(account_index);
+
+        DiemAccountResource::new(
+            account_info.sequence_number,
+            account_info.public_key.to_bytes().to_vec(),
+            self.withdrawal_capability,
+            self.key_rotation_capability,
+            account_info.sent_event_handle.clone(),
+            account_info.received_event_handle.clone(),
+        )
+    }
+}
+
+#[derive(Arbitrary, Debug)]
+pub struct AccountResourceGen;
 
 impl AccountResourceGen {
     pub fn materialize(
@@ -676,14 +700,10 @@ impl AccountResourceGen {
         universe: &AccountInfoUniverse,
     ) -> AccountResource {
         let account_info = universe.get_account_info(account_index);
-
         AccountResource::new(
             account_info.sequence_number,
             account_info.public_key.to_bytes().to_vec(),
-            self.withdrawal_capability,
-            self.key_rotation_capability,
-            account_info.sent_event_handle.clone(),
-            account_info.received_event_handle.clone(),
+            account_info.address,
         )
     }
 }
@@ -701,8 +721,9 @@ impl BalanceResourceGen {
 
 #[derive(Arbitrary, Debug)]
 pub struct AccountStateBlobGen {
-    account_resource_gen: AccountResourceGen,
+    diem_account_resource_gen: DiemAccountResourceGen,
     balance_resource_gen: BalanceResourceGen,
+    account_resource_gen: AccountResourceGen,
 }
 
 impl AccountStateBlobGen {
@@ -711,11 +732,15 @@ impl AccountStateBlobGen {
         account_index: Index,
         universe: &AccountInfoUniverse,
     ) -> AccountStateBlob {
+        let diem_account_resource = self
+            .diem_account_resource_gen
+            .materialize(account_index, universe);
         let account_resource = self
             .account_resource_gen
             .materialize(account_index, universe);
         let balance_resource = self.balance_resource_gen.materialize();
-        AccountStateBlob::try_from((&account_resource, &balance_resource)).unwrap()
+        AccountStateBlob::try_from((&account_resource, &diem_account_resource, &balance_resource))
+            .unwrap()
     }
 }
 
@@ -827,12 +852,11 @@ impl TransactionToCommitGen {
 
         TransactionToCommit::new(
             Transaction::UserTransaction(transaction),
+            TransactionInfo::new_placeholder(self.gas_used, self.status),
             account_states,
             None,
             self.write_set,
             events,
-            self.gas_used,
-            self.status,
         )
     }
 }
@@ -1073,6 +1097,51 @@ impl LedgerInfoGen {
             self.commit_info_gen.materialize(universe, block_size),
             self.consensus_data_hash,
         )
+    }
+}
+
+#[derive(Debug)]
+pub struct BlockGen {
+    txn_gens: Vec<TransactionToCommitGen>,
+    ledger_info_gen: LedgerInfoGen,
+}
+
+impl Arbitrary for BlockGen {
+    type Parameters = usize;
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(max_user_txns: Self::Parameters) -> Self::Strategy {
+        assert!(max_user_txns >= 1);
+        (
+            vec(any::<TransactionToCommitGen>(), 1..=max_user_txns),
+            any::<LedgerInfoGen>(),
+        )
+            .prop_map(|(txn_gens, ledger_info_gen)| Self {
+                txn_gens,
+                ledger_info_gen,
+            })
+            .boxed()
+    }
+}
+
+impl BlockGen {
+    pub fn materialize(
+        self,
+        universe: &mut AccountInfoUniverse,
+    ) -> (Vec<TransactionToCommit>, LedgerInfo) {
+        let mut txns_to_commit = Vec::new();
+
+        // materialize user transactions
+        for txn_gen in self.txn_gens {
+            txns_to_commit.push(txn_gen.materialize(universe));
+        }
+
+        // materialize ledger info
+        let ledger_info = self
+            .ledger_info_gen
+            .materialize(universe, txns_to_commit.len());
+
+        (txns_to_commit, ledger_info)
     }
 }
 

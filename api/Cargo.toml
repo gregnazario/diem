@@ -10,7 +10,7 @@ publish = false
 edition = "2018"
 
 [dependencies]
-anyhow = "1.0.38"
+anyhow = "1.0.52"
 bcs = "0.1.2"
 bytes = "1.0.1"
 fail = "0.4.0"
@@ -34,8 +34,8 @@ diem-types = { path = "../types" }
 diem-workspace-hack = { version = "0.1", path = "../crates/diem-workspace-hack" }
 diem-api-types = { path = "./types", package = "diem-api-types" }
 storage-interface = { path = "../storage/storage-interface" }
-move-core-types = { path = "../language/move-core/types" }
-move-resource-viewer = { path = "../language/tools/move-resource-viewer" }
+move-core-types = { git = "https://github.com/diem/move", rev = "98ed299a7e3a9223019c9bdf4dd92fea9faef860" }
+move-resource-viewer = { git = "https://github.com/diem/move", rev = "98ed299a7e3a9223019c9bdf4dd92fea9faef860" }
 
 [dev-dependencies]
 rand = "0.8.3"
