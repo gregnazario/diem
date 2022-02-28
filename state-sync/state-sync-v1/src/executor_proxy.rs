@@ -13,7 +13,8 @@ use diem_types::{
     move_resource::MoveStorage, transaction::TransactionListWithProof,
 };
 use event_notifications::{EventNotificationSender, EventSubscriptionService};
-use executor_types::{ChunkExecutorTrait, ExecutedTrees};
+use executor::components::apply_chunk_output::IntoLedgerView;
+use executor_types::ChunkExecutorTrait;
 use std::sync::Arc;
 use storage_interface::DbReader;
 
@@ -52,27 +53,27 @@ pub trait ExecutorProxyTrait: Send {
     fn publish_event_notifications(&mut self, events: Vec<ContractEvent>) -> Result<(), Error>;
 }
 
-pub(crate) struct ExecutorProxy {
+pub(crate) struct ExecutorProxy<C> {
     storage: Arc<dyn DbReader>,
-    executor: Box<dyn ChunkExecutorTrait>,
+    chunk_executor: Arc<C>,
     event_subscription_service: EventSubscriptionService,
 }
 
-impl ExecutorProxy {
+impl<C: ChunkExecutorTrait> ExecutorProxy<C> {
     pub(crate) fn new(
         storage: Arc<dyn DbReader>,
-        executor: Box<dyn ChunkExecutorTrait>,
+        chunk_executor: Arc<C>,
         event_subscription_service: EventSubscriptionService,
     ) -> Self {
         Self {
             storage,
-            executor,
+            chunk_executor,
             event_subscription_service,
         }
     }
 }
 
-impl ExecutorProxyTrait for ExecutorProxy {
+impl<C: ChunkExecutorTrait> ExecutorProxyTrait for ExecutorProxy<C> {
     fn get_local_storage_state(&self) -> Result<SyncState, Error> {
         let storage_info = self.storage.get_startup_info().map_err(|error| {
             Error::UnexpectedError(format!(
@@ -83,15 +84,20 @@ impl ExecutorProxyTrait for ExecutorProxy {
         let storage_info = storage_info
             .ok_or_else(|| Error::UnexpectedError("Missing startup info from storage".into()))?;
         let current_epoch_state = storage_info.get_epoch_state().clone();
+        let latest_ledger_info = storage_info.latest_ledger_info.clone();
 
-        let synced_trees = if let Some(synced_tree_state) = storage_info.synced_tree_state {
-            ExecutedTrees::from(synced_tree_state)
-        } else {
-            ExecutedTrees::from(storage_info.committed_tree_state)
-        };
+        let synced_trees = storage_info
+            .into_latest_tree_state()
+            .into_ledger_view(&self.storage)
+            .map_err(|error| {
+                Error::UnexpectedError(format!(
+                    "Failed to construct latest ledger view from storage: {}",
+                    error
+                ))
+            })?;
 
         Ok(SyncState::new(
-            storage_info.latest_ledger_info,
+            latest_ledger_info,
             synced_trees,
             current_epoch_state,
         ))
@@ -105,8 +111,8 @@ impl ExecutorProxyTrait for ExecutorProxy {
     ) -> Result<(), Error> {
         // track chunk execution time
         let timer = counters::EXECUTE_CHUNK_DURATION.start_timer();
-        let events = self
-            .executor
+        let (events, _) = self
+            .chunk_executor
             .execute_and_commit_chunk(
                 txn_list_with_proof,
                 &verified_target_li,
@@ -377,7 +383,7 @@ mod tests {
             .unwrap();
 
         // Create an executor proxy
-        let chunk_executor = Box::new(ChunkExecutor::<DiemVM>::new(db_rw).unwrap());
+        let chunk_executor = Arc::new(ChunkExecutor::<DiemVM>::new(db_rw).unwrap());
         let mut executor_proxy = ExecutorProxy::new(db, chunk_executor, event_subscription_service);
 
         // Publish a subscribed event
@@ -579,7 +585,7 @@ mod tests {
             .unwrap();
 
         // Create an executor
-        let chunk_executor = Box::new(ChunkExecutor::<DiemVM>::new(db_rw.clone()).unwrap());
+        let chunk_executor = Arc::new(ChunkExecutor::<DiemVM>::new(db_rw.clone()).unwrap());
         let mut executor_proxy = ExecutorProxy::new(db, chunk_executor, event_subscription_service);
 
         // Verify that the initial configs returned to the subscriber don't contain the unknown on-chain config
@@ -622,7 +628,7 @@ mod tests {
     ) -> (
         Vec<TestValidator>,
         Box<BlockExecutor<DiemVM>>,
-        ExecutorProxy,
+        ExecutorProxy<ChunkExecutor<DiemVM>>,
         ReconfigNotificationListener,
     ) {
         // Generate a genesis change set
@@ -662,7 +668,7 @@ mod tests {
 
         // Create the executors
         let block_executor = Box::new(BlockExecutor::<DiemVM>::new(db_rw.clone()));
-        let chunk_executor = Box::new(ChunkExecutor::<DiemVM>::new(db_rw).unwrap());
+        let chunk_executor = Arc::new(ChunkExecutor::<DiemVM>::new(db_rw).unwrap());
         let executor_proxy = ExecutorProxy::new(db, chunk_executor, event_subscription_service);
 
         (

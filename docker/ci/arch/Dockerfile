@@ -1,5 +1,5 @@
 # while using circle we'll use circle's base image.
-FROM archlinux:base-devel-20211024.0.37588@sha256:4371fd5b5d2d99ee73e25b3b9a8d7b2258e371852dd0c5681802bf94b069aadf AS setup_ci_arch
+FROM archlinux:base-devel-20220220.0.48372@sha256:fc5a263d489257eb36091e778dcd1d18efaca11ebfa8bbe323eb611f33f37429 AS setup_ci_arch
 
 WORKDIR /diem
 COPY rust-toolchain /diem/rust-toolchain
@@ -13,7 +13,9 @@ ENV RUSTUP_HOME "/opt/rustup"
 # WORKAROUND for glibc 2.33 and old Docker
 # See https://github.com/actions/virtual-environments/issues/2658
 # Thanks to https://github.com/lxqt/lxqt-panel/pull/1562
-RUN patched_glibc=glibc-linux4-2.33-4-x86_64.pkg.tar.zst && \
+RUN pacman -Sy archlinux-keyring --noconfirm && \
+    rm -rf /etc/pacman.d/gnupg/* && pacman-key --init && pacman-key --populate archlinux && \
+    patched_glibc=glibc-linux4-2.33-4-x86_64.pkg.tar.zst && \
     curl -LO "https://repo.archlinuxcn.org/x86_64/$patched_glibc" && \
     bsdtar -C / -xvf "$patched_glibc" && \
     mkdir -p /github/home && \

@@ -1,15 +1,21 @@
 // Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{error::Error, storage_synchronizer::StorageStateSummary};
+use crate::error::Error;
 use consensus_notifications::{
     ConsensusCommitNotification, ConsensusNotification, ConsensusNotificationListener,
     ConsensusSyncNotification,
 };
+use data_streaming_service::data_notification::NotificationId;
 use diem_infallible::Mutex;
 use diem_logger::prelude::*;
-use diem_types::{ledger_info::LedgerInfoWithSignatures, transaction::Transaction};
-use futures::{stream::FusedStream, Stream};
+use diem_types::{
+    contract_event::ContractEvent,
+    ledger_info::LedgerInfoWithSignatures,
+    transaction::{Transaction, Version},
+};
+use event_notifications::{EventNotificationSender, EventSubscriptionService};
+use futures::{channel::mpsc, stream::FusedStream, Stream};
 use mempool_notifications::MempoolNotificationSender;
 use std::{
     pin::Pin,
@@ -21,6 +27,88 @@ use std::{
 // TODO(joshlind): make these configurable!
 const CONSENSUS_SYNC_REQUEST_TIMEOUT_MS: u64 = 60000; // 1 minute
 const MEMPOOL_COMMIT_ACK_TIMEOUT_MS: u64 = 5000; // 5 seconds
+
+/// A notification for new transactions and events that have been committed to
+/// storage.
+pub struct CommitNotification {
+    pub events: Vec<ContractEvent>,
+    pub transactions: Vec<Transaction>,
+}
+
+impl CommitNotification {
+    pub fn new(events: Vec<ContractEvent>, transactions: Vec<Transaction>) -> Self {
+        Self {
+            events,
+            transactions,
+        }
+    }
+
+    /// Handles the commit notification by notifying mempool and the event
+    /// subscription service.
+    pub async fn handle_commit_notification<M: MempoolNotificationSender>(
+        &self,
+        latest_synced_version: Version,
+        latest_synced_ledger_info: LedgerInfoWithSignatures,
+        mut mempool_notification_handler: MempoolNotificationHandler<M>,
+        event_subscription_service: Arc<Mutex<EventSubscriptionService>>,
+    ) -> Result<(), Error> {
+        // Notify mempool of the committed transactions
+        debug!(
+            "Notifying mempool of transactions at version: {:?}",
+            latest_synced_version
+        );
+        let blockchain_timestamp_usecs = latest_synced_ledger_info.ledger_info().timestamp_usecs();
+        mempool_notification_handler
+            .notify_mempool_of_committed_transactions(
+                self.transactions.clone(),
+                blockchain_timestamp_usecs,
+            )
+            .await?;
+
+        // Notify the event subscription service of the events
+        debug!(
+            "Notifying the event subscription service of events at version: {:?}",
+            latest_synced_version
+        );
+        event_subscription_service
+            .lock()
+            .notify_events(latest_synced_version, self.events.clone())
+            .map_err(|error| error.into())
+    }
+}
+
+/// A simple wrapper for a commit notification listener
+pub struct CommitNotificationListener {
+    // The listener for commit notifications
+    commit_notification_listener: mpsc::UnboundedReceiver<CommitNotification>,
+}
+
+impl CommitNotificationListener {
+    pub fn new() -> (mpsc::UnboundedSender<CommitNotification>, Self) {
+        // Create a channel to send and receive commit notifications
+        let (commit_notification_sender, commit_notification_listener) = mpsc::unbounded();
+
+        // Create and return the sender and listener
+        let commit_notification_listener = Self {
+            commit_notification_listener,
+        };
+        (commit_notification_sender, commit_notification_listener)
+    }
+}
+
+impl Stream for CommitNotificationListener {
+    type Item = CommitNotification;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().commit_notification_listener).poll_next(cx)
+    }
+}
+
+impl FusedStream for CommitNotificationListener {
+    fn is_terminated(&self) -> bool {
+        self.commit_notification_listener.is_terminated()
+    }
+}
 
 /// A consensus sync request for a specified target ledger info
 pub struct ConsensusSyncRequest {
@@ -80,14 +168,11 @@ impl ConsensusNotificationHandler {
     pub async fn initialize_sync_request(
         &mut self,
         sync_notification: ConsensusSyncNotification,
-        latest_storage_summary: StorageStateSummary,
+        latest_synced_ledger_info: LedgerInfoWithSignatures,
     ) -> Result<(), Error> {
         // Get the latest committed version and the target sync version
         let sync_target_version = sync_notification.target.ledger_info().version();
-        let latest_committed_version = latest_storage_summary
-            .latest_ledger_info
-            .ledger_info()
-            .version();
+        let latest_committed_version = latest_synced_ledger_info.ledger_info().version();
 
         // If the target version is old, return an error to consensus (something is wrong!)
         if sync_target_version < latest_committed_version {
@@ -119,7 +204,7 @@ impl ConsensusNotificationHandler {
     /// Checks to see if the sync request has been successfully fulfilled
     pub async fn check_sync_request_progress(
         &mut self,
-        latest_storage_summary: &StorageStateSummary,
+        latest_synced_ledger_info: LedgerInfoWithSignatures,
     ) -> Result<(), Error> {
         // Fetch the sync target version
         let consensus_sync_request = self.get_consensus_sync_request();
@@ -133,10 +218,7 @@ impl ConsensusNotificationHandler {
 
         // Compare our local state to the target version
         if let Some(sync_target_version) = sync_target_version {
-            let latest_committed_version = latest_storage_summary
-                .latest_ledger_info
-                .ledger_info()
-                .version();
+            let latest_committed_version = latest_synced_ledger_info.ledger_info().version();
 
             // Check if we've synced beyond the target
             if latest_committed_version > sync_target_version {
@@ -207,6 +289,11 @@ impl ConsensusNotificationHandler {
             consensus_notifications::Error::UnexpectedErrorEncountered(format!("{:?}", error))
         });
 
+        debug!(
+            "Responding to consensus sync notification with message: {:?}",
+            message
+        );
+
         // Send the result
         self.consensus_listener
             .respond_to_sync_notification(sync_notification, message)
@@ -230,6 +317,11 @@ impl ConsensusNotificationHandler {
             consensus_notifications::Error::UnexpectedErrorEncountered(format!("{:?}", error))
         });
 
+        debug!(
+            "Responding to consensus commit notification with message: {:?}",
+            message
+        );
+
         // Send the result
         self.consensus_listener
             .respond_to_commit_notification(commit_notification, message)
@@ -251,6 +343,47 @@ impl Stream for ConsensusNotificationHandler {
 impl FusedStream for ConsensusNotificationHandler {
     fn is_terminated(&self) -> bool {
         self.consensus_listener.is_terminated()
+    }
+}
+
+/// A notification for error transactions and events that have been committed to
+/// storage.
+#[derive(Clone, Debug)]
+pub struct ErrorNotification {
+    pub error: Error,
+    pub notification_id: NotificationId,
+}
+
+/// A simple wrapper for an error notification listener
+pub struct ErrorNotificationListener {
+    // The listener for error notifications
+    error_notification_listener: mpsc::UnboundedReceiver<ErrorNotification>,
+}
+
+impl ErrorNotificationListener {
+    pub fn new() -> (mpsc::UnboundedSender<ErrorNotification>, Self) {
+        // Create a channel to send and receive error notifications
+        let (error_notification_sender, error_notification_listener) = mpsc::unbounded();
+
+        // Create and return the sender and listener
+        let error_notification_listener = Self {
+            error_notification_listener,
+        };
+        (error_notification_sender, error_notification_listener)
+    }
+}
+
+impl Stream for ErrorNotificationListener {
+    type Item = ErrorNotification;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().error_notification_listener).poll_next(cx)
+    }
+}
+
+impl FusedStream for ErrorNotificationListener {
+    fn is_terminated(&self) -> bool {
+        self.error_notification_listener.is_terminated()
     }
 }
 
